@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pokies Vault</string>
+    <string name="tagline">Smart Casino Account &amp; Bonus Vault</string>
+    <string name="nav_directory">Directory</string>
+    <string name="nav_fetcher">Fetcher</string>
+    <string name="nav_bonuses">Bonuses</string>
+    <string name="nav_intel">Intel</string>
+    <string name="open_settings">Vault settings</string>
+    <string name="close_settings">Close settings</string>
+    <string name="add_domain">Add domain</string>
+    <string name="search_directory_hint">Search casinos or domains…</string>
+    <string name="search_bonuses_hint">Search domains or promotions…</string>
+    <string name="search_intel_hint">Filter domains…</string>
+    <string name="fetcher_title">Account Fetcher</string>
+    <string name="fetcher_subtitle">Parallel adaptive login across shared-platform wallets. Credentials are encrypted on-device and never uploaded.</string>
+    <string name="bonus_finder_title">Bonus Finder</string>
+    <string name="bonus_finder_subtitle">Scan public deposit match, free signup, share, daily, and birthday offers without signing in.</string>
+    <string name="domain_intel_title">Domain Intel</string>
+    <string name="domain_intel_subtitle">Unified domain registry across Directory, Fetcher, and Bonus Finder with live latency telemetry.</string>
+    <string name="gamble_responsibly">18+ Gamble responsibly. Need help? Gambling Help Online — 1800 858 858 · BetStop</string>
+    <string name="vault_disclaimer">Pokies Vault checks sites you already use. It does not take bets, sell fetches, or rent listings. Passwords stay encrypted on this device.</string>
+</resources>

@@ -1,0 +1,1458 @@
+import { Link } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { ChevronLeft, Eye, EyeOff, Loader2, RefreshCw } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { visibleSites } from "@/lib/working-sites";
+import { useVault, type AttentionMark, type FallbackCred } from "@/components/vault";
+import { SiteIcon } from "@/components/site-icon";
+import { AccountCard } from "@/components/account-card";
+import { fetchCasinoBatchFn, lookupMerchantsFn } from "@/lib/casino.functions";
+import { listFetchRunsFn, recordFetchRunFn } from "@/lib/fetch-log.functions";
+import type { FetchRunReport } from "@/lib/fetch-log.server";
+import { fetchAccountOnDevice } from "@/lib/fetch-on-device";
+import { isPublicDomain, normalizeDomain } from "@/lib/domain";
+import { money, formatAdded } from "@/lib/format";
+import { compareSites } from "@/lib/order";
+import type { AccountCode, AccountErr, AccountOk, AccountRow } from "@/lib/parse-account";
+
+const PAGE = 12;
+const BATCH = 10;
+const RUN_KEY = "vault-run";
+const KNOWN_KEY = "pokies_vault_known_systems_v1";
+const MERCHANT_KEY = "pokies_vault_merchants_v1";
+const MODE_KEY = "pokies_vault_merchant_mode_v1";
+const START_WORKERS = 16;
+const START_GAP_MS = 500;
+const RETRY_GAP_MS = 7_000;
+
+type RunCheckpoint = { at: number; done: string[]; rows: AccountRow[] };
+
+type LiveStats = {
+  phase: "idle" | "running" | "done" | "stopped";
+  fromPhone: boolean;
+  done: number;
+  total: number;
+  startedAt: number | null;
+  finishedAt: number | null;
+  fetchMs: number;
+  attempts: number;
+  retries: number;
+  peakQueue: number;
+  workers: number;
+};
+
+const IDLE_LIVE: LiveStats = {
+  phase: "idle",
+  fromPhone: false,
+  done: 0,
+  total: 0,
+  startedAt: null,
+  finishedAt: null,
+  fetchMs: 0,
+  attempts: 0,
+  retries: 0,
+  peakQueue: 0,
+  workers: 0,
+};
+
+function formatSpan(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes <= 0) return `${rest}s`;
+  return `${minutes}m ${rest}s`;
+}
+
+function viaLabel(fromPhone: boolean): string {
+  return fromPhone ? "From this phone" : "From the vault";
+}
+
+function readRun(): RunCheckpoint | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(RUN_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<RunCheckpoint>;
+    if (!parsed || !Array.isArray(parsed.done) || !Array.isArray(parsed.rows)) return null;
+    return { at: typeof parsed.at === "number" ? parsed.at : Date.now(), done: parsed.done, rows: parsed.rows };
+  } catch {
+    return null;
+  }
+}
+
+function loadKnown(logins: Record<string, FallbackCred>, rows: AccountRow[]): Set<string> {
+  const known = new Set<string>();
+  try {
+    const raw = JSON.parse(localStorage.getItem(KNOWN_KEY) || "[]") as unknown;
+    if (Array.isArray(raw)) {
+      for (const item of raw) {
+        const domain = normalizeDomain(String(item));
+        if (isPublicDomain(domain)) known.add(domain);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  for (const domain of Object.keys(logins)) {
+    const clean = normalizeDomain(domain);
+    if (isPublicDomain(clean)) known.add(clean);
+  }
+  for (const row of rows) if (row.ok) known.add(row.domain);
+  return known;
+}
+
+function saveKnown(known: Set<string>) {
+  try {
+    localStorage.setItem(KNOWN_KEY, JSON.stringify([...known]));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function loadMerchantMap(): Record<string, { host: string; merchantId: string }> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MERCHANT_KEY) || "{}") as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Record<string, { host: string; merchantId: string }> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const domain = normalizeDomain(key);
+      if (!isPublicDomain(domain) || !value || typeof value !== "object") continue;
+      const merchantId = String((value as { merchantId?: unknown }).merchantId ?? "");
+      const host = normalizeDomain(String((value as { host?: unknown }).host ?? domain));
+      if (!/^\d{1,12}$/.test(merchantId)) continue;
+      out[domain] = { host: isPublicDomain(host) ? host : domain, merchantId };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function loadModeMap(): Record<string, "id" | "blank"> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(MODE_KEY) || "{}") as unknown;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const out: Record<string, "id" | "blank"> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const domain = normalizeDomain(key);
+      if (!isPublicDomain(domain)) continue;
+      if (value === "id" || value === "blank") out[domain] = value;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function credsFor(domain: string, form: FallbackCred[], saved: Record<string, FallbackCred>): FallbackCred[] {
+  const ordered: FallbackCred[] = [];
+  const seen = new Set<string>();
+  const push = (login: FallbackCred | null) => {
+    if (!login || seen.has(loginKey(login))) return;
+    seen.add(loginKey(login));
+    ordered.push(login);
+  };
+  push(usableLogin(saved[domain]));
+  for (const login of form) push(login);
+  return ordered;
+}
+
+function writeRun(checkpoint: RunCheckpoint) {
+  const slim = { at: checkpoint.at, done: checkpoint.done, rows: [] as AccountRow[] };
+  try {
+    localStorage.setItem(RUN_KEY, JSON.stringify(checkpoint));
+  } catch {
+    try {
+      localStorage.setItem(RUN_KEY, JSON.stringify(slim));
+    } catch {
+      /* ignore quota */
+    }
+  }
+}
+
+function overlayRows(base: AccountRow[], updates: AccountRow[]): AccountRow[] {
+  const map = new Map(base.map((row) => [row.domain, row]));
+  for (const row of updates) map.set(row.domain, row);
+  return [...map.values()];
+}
+
+function chunkDomains(domains: string[]): string[][] {
+  const batches: string[][] = [];
+  for (let i = 0; i < domains.length; i += BATCH) batches.push(domains.slice(i, i + BATCH));
+  return batches;
+}
+
+function loginKey(login: FallbackCred): string {
+  return `${login.phone}\0${login.password}`;
+}
+
+function usableLogin(login: FallbackCred | null | undefined): FallbackCred | null {
+  if (!login) return null;
+  const phone = login.phone.replace(/\s+/g, "");
+  if (!/^[0-9+]{6,20}$/.test(phone) || login.password.length < 4 || login.password.length > 64) return null;
+  return { phone, password: login.password };
+}
+
+function planBatches(domains: string[], form: FallbackCred[], saved: Record<string, FallbackCred>) {
+  const groups = new Map<string, { first: FallbackCred; domains: string[] }>();
+  const fresh: string[] = [];
+  for (const domain of domains) {
+    const known = usableLogin(saved[domain]);
+    if (!known) {
+      fresh.push(domain);
+      continue;
+    }
+    const key = loginKey(known);
+    const group = groups.get(key);
+    if (group) group.domains.push(domain);
+    else groups.set(key, { first: known, domains: [domain] });
+  }
+  const batches: { domains: string[]; creds: FallbackCred[] }[] = [];
+  for (const group of groups.values()) {
+    const rest = form.filter((cred) => loginKey(cred) !== loginKey(group.first));
+    for (const slice of chunkDomains(group.domains)) {
+      batches.push({ domains: slice, creds: [group.first, ...rest] });
+    }
+  }
+  if (fresh.length && form.length) {
+    for (const slice of chunkDomains(fresh)) batches.push({ domains: slice, creds: form });
+  }
+  return { batches, unseen: form.length ? 0 : fresh.length };
+}
+
+function cents(amount: number): number {
+  return Math.round(amount * 100) / 100;
+}
+
+type MoneyBox = { label: string; amount: number; kind: "wallet" | "promo" };
+
+type ChangeNote = {
+  id: string;
+  domain: string;
+  label: string;
+  from: number | null;
+  to: number | null;
+};
+
+function boxesOf(row: AccountOk): MoneyBox[] {
+  const wallets = row.wallets.filter((wallet) => wallet.balance > 0.001);
+  const walletBoxes: MoneyBox[] = wallets.length
+    ? wallets.map((wallet) => ({ label: wallet.name, amount: wallet.balance, kind: "wallet" }))
+    : row.cash > 0.001
+      ? [{ label: row.cashWalletName, amount: row.cash, kind: "wallet" }]
+      : [];
+  const promos: MoneyBox[] = (row.promoBoxes ?? [])
+    .filter((box) => box.amount > 0.001)
+    .map((box) => ({ label: box.label, amount: box.amount, kind: "promo" }));
+  return [...walletBoxes, ...promos];
+}
+
+function totalsOf(row: AccountOk): { wallets: number; claimable: number; total: number } {
+  let wallets = 0;
+  let claimable = 0;
+  for (const box of boxesOf(row)) {
+    if (box.kind === "wallet") wallets += box.amount;
+    else claimable += box.amount;
+  }
+  wallets = cents(wallets);
+  claimable = cents(claimable);
+  return { wallets, claimable, total: cents(wallets + claimable) };
+}
+
+function boxMap(row: AccountOk): Map<string, MoneyBox> {
+  const map = new Map<string, MoneyBox>();
+  for (const box of boxesOf(row)) {
+    const key = `${box.kind}\0${box.label}`;
+    const current = map.get(key);
+    if (current) current.amount = cents(current.amount + box.amount);
+    else map.set(key, { ...box, amount: cents(box.amount) });
+  }
+  return map;
+}
+
+function changesFor(before: AccountOk | undefined, after: AccountOk): ChangeNote[] {
+  if (!before?.ok) {
+    const total = totalsOf(after).total;
+    if (total <= 0) return [];
+    return [{ id: `${after.domain}:new`, domain: after.domain, label: "Now showing", from: null, to: total }];
+  }
+  const prev = boxMap(before);
+  const next = boxMap(after);
+  const notes: ChangeNote[] = [];
+  const keys = new Set([...prev.keys(), ...next.keys()]);
+  for (const key of keys) {
+    const oldBox = prev.get(key);
+    const newBox = next.get(key);
+    const from = oldBox?.amount ?? null;
+    const to = newBox?.amount ?? null;
+    if (from != null && to != null && Math.abs(from - to) < 0.01) continue;
+    if (from == null && to == null) continue;
+    const label = newBox?.label ?? oldBox?.label ?? "Balance";
+    notes.push({ id: `${after.domain}:${key}`, domain: after.domain, label, from, to });
+  }
+  notes.sort((a, b) => Math.abs((b.to ?? 0) - (b.from ?? 0)) - Math.abs((a.to ?? 0) - (a.from ?? 0)));
+  return notes;
+}
+
+function deltaText(note: ChangeNote): string {
+  if (note.from == null && note.to != null) {
+    return note.label === "Now showing" ? money(note.to) : `New ${money(note.to)}`;
+  }
+  if (note.to == null) return `${money(note.from)} → ${money(0)}`;
+  return `${money(note.from)} → ${money(note.to)}`;
+}
+
+function deltaClass(note: ChangeNote): string {
+  const from = note.from ?? 0;
+  const to = note.to ?? 0;
+  if (to > from + 0.009) return "delta up";
+  if (to < from - 0.009) return "delta down";
+  return "delta";
+}
+
+function PageList({ rows, addedAt }: { rows: AccountOk[]; addedAt: (domain: string) => string | null }) {
+  const [page, setPage] = useState(0);
+  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
+  const safe = Math.min(page, pages - 1);
+  const slice = rows.slice(safe * PAGE, safe * PAGE + PAGE);
+  return (
+    <>
+      {pages > 1 ? (
+        <div className="pager">
+          <button type="button" className="btn" disabled={safe === 0} onClick={() => setPage(safe - 1)}>
+            Previous
+          </button>
+          <span>
+            Page {safe + 1} / {pages}
+          </span>
+          <button
+            type="button"
+            className="btn"
+            disabled={safe >= pages - 1}
+            onClick={() => setPage(safe + 1)}
+          >
+            Next
+          </button>
+        </div>
+      ) : null}
+      <div className="stack">
+        {slice.map((row, index) => (
+          <AccountCard
+            key={row.domain}
+            domain={row.domain}
+            rank={safe * PAGE + index + 1}
+            addedAt={addedAt(row.domain)}
+            account={row}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+const CODE_LABEL: Record<AccountCode, string> = {
+  captcha: "Captcha",
+  invalid_login: "Not your account",
+  timeout: "Timed out",
+  unreachable: "Unreachable",
+  blocked: "Page blocked",
+  empty: "Empty page",
+  unsupported: "Different login",
+  other: "Other",
+};
+
+const CODE_ORDER: AccountCode[] = [
+  "captcha",
+  "invalid_login",
+  "timeout",
+  "unreachable",
+  "blocked",
+  "empty",
+  "unsupported",
+  "other",
+];
+
+function isMarked(marks: AttentionMark[], domain: string, code: string): boolean {
+  return marks.some((mark) => mark.domain === domain && mark.code === code);
+}
+
+function NeedsAttention({
+  savedAt,
+  rows,
+  marks,
+  onToggle,
+}: {
+  savedAt: number | null;
+  rows: AccountErr[];
+  marks: AttentionMark[];
+  onToggle: (domain: string, code: string) => void;
+}) {
+  const [showChecked, setShowChecked] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const stamp = savedAt ? formatAdded(new Date(savedAt).toISOString()) : "";
+  const counts = CODE_ORDER.map((code) => ({
+    code,
+    count: rows.filter((row) => row.code === code).length,
+  })).filter((item) => item.count > 0);
+  const hidden = rows.filter((row) => isMarked(marks, row.domain, row.code)).length;
+  const visible = showChecked ? rows : rows.filter((row) => !isMarked(marks, row.domain, row.code));
+  const groups = counts
+    .map((item) => ({
+      ...item,
+      rows: visible.filter((row) => row.code === item.code),
+    }))
+    .filter((group) => group.rows.length > 0);
+
+  return (
+    <section className="panel attention">
+      <h2 className="section-label">Needs attention · {rows.length}</h2>
+      <p className="hint">Rejected sites are saved with the fetch. A checked row stays hidden until that site comes back with a different code.</p>
+      {counts.length ? (
+        <p className="attention-counts">
+          {counts.map((item) => (
+            <span key={item.code}>
+              {CODE_LABEL[item.code]} <b>{item.count}</b>
+            </span>
+          ))}
+        </p>
+      ) : (
+        <p className="hint">No rejected sites saved yet.</p>
+      )}
+      {hidden > 0 ? (
+        <button type="button" className="btn" onClick={() => setShowChecked((value) => !value)}>
+          {showChecked ? "Hide checked" : `Show checked (${hidden})`}
+        </button>
+      ) : null}
+      {groups.map((group) => (
+        <div className="attention-group" key={group.code}>
+          <h3>
+            {CODE_LABEL[group.code]} · {group.rows.length}
+          </h3>
+          <div className="attention-table">
+            {(expanded[group.code] ? group.rows : group.rows.slice(0, 30)).map((row) => {
+              const checked = isMarked(marks, row.domain, row.code);
+              return (
+                <div className="attention-row" key={`${row.domain}-${row.code}`}>
+                  <label className="attention-check">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => onToggle(row.domain, row.code)}
+                    />
+                    <span className="sr">Checked</span>
+                  </label>
+                  <strong className="attention-domain">{row.domain}</strong>
+                  <span className="attention-code">{CODE_LABEL[row.code]}</span>
+                  <span className="attention-message">{row.message}</span>
+                  <time dateTime={savedAt ? new Date(savedAt).toISOString() : undefined}>{stamp}</time>
+                  <a href={`https://${row.domain}/`} target="_blank" rel="noreferrer">
+                    Open
+                  </a>
+                </div>
+              );
+            })}
+            {group.rows.length > 30 && !expanded[group.code] ? (
+              <button type="button" className="btn" onClick={() => setExpanded((current) => ({ ...current, [group.code]: true }))}>
+                Show all {group.rows.length}
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ))}
+    </section>
+  );
+}
+
+export function Fetcher() {
+  const { state, patch, rememberAccount, rememberLogins, saveFetch } = useVault();
+  const fetchBatch = useServerFn(fetchCasinoBatchFn);
+  const lookupMerchants = useServerFn(lookupMerchantsFn);
+  const recordFetchRun = useServerFn(recordFetchRunFn);
+  const listFetchRuns = useServerFn(listFetchRunsFn);
+  const [onDevice, setOnDevice] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const [single, setSingle] = useState("");
+  const [status, setStatus] = useState("Enter the phone number and password you use on these sites.");
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [live, setLive] = useState<LiveStats>(IDLE_LIVE);
+  const [now, setNow] = useState(() => Date.now());
+  const [rows, setRows] = useState<AccountRow[]>(state.lastFetch?.rows ?? []);
+  const [showErrors, setShowErrors] = useState(false);
+  const [confirmScan, setConfirmScan] = useState(false);
+  const [diffs, setDiffs] = useState<ChangeNote[]>([]);
+  const [comparedAt, setComparedAt] = useState<number | null>(null);
+  const [pendingRun, setPendingRun] = useState<RunCheckpoint | null>(null);
+  const [outgoing, setOutgoing] = useState<{ ip: string; isp: string; place: string } | null>(null);
+  const [outgoingError, setOutgoingError] = useState("");
+  const [outgoingLoading, setOutgoingLoading] = useState(false);
+  const [outgoingTick, setOutgoingTick] = useState(0);
+  const [sharedRuns, setSharedRuns] = useState<FetchRunReport[]>([]);
+  const stopRef = useRef<AbortController | null>(null);
+  const onDeviceRef = useRef(false);
+  const liveRef = useRef(live);
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+
+  useEffect(() => {
+    onDeviceRef.current = true;
+    setOnDevice(true);
+  }, []);
+
+  useEffect(() => {
+    void listFetchRuns()
+      .then((runs) => setSharedRuns(runs))
+      .catch(() => setSharedRuns([]));
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setOutgoingLoading(true);
+    setOutgoingError("");
+    const load = async () => {
+      const response = await fetch("https://ipwho.is/", { cache: "no-store" });
+      const data = (await response.json()) as {
+        success?: boolean;
+        ip?: string;
+        city?: string;
+        country_code?: string;
+        connection?: { isp?: string; org?: string };
+      };
+      if (!data.success || !data.ip) throw new Error("no ip");
+      return {
+        ip: data.ip,
+        isp: data.connection?.isp || data.connection?.org || "Unknown network",
+        place: [data.city, data.country_code].filter(Boolean).join(", "),
+      };
+    };
+    void load()
+      .then((info) => {
+        if (!cancelled) setOutgoing(info);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setOutgoing(null);
+          setOutgoingError("Could not read the outgoing IP");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setOutgoingLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [outgoingTick]);
+
+  useEffect(() => {
+    if (live.phase !== "running") return;
+    const id = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(id);
+  }, [live.phase]);
+
+  const sites = useMemo(
+    () => visibleSites(state),
+    [state],
+  );
+
+  useEffect(() => {
+    const saved = readRun();
+    if (saved && saved.done.length < sites.length) setPendingRun(saved);
+  }, [sites.length]);
+
+  const creds = useMemo(() => {
+    const list = [usableLogin({ phone: state.phone, password: state.password })];
+    for (const item of state.fallbacks) list.push(usableLogin(item));
+    const seen = new Set<string>();
+    const out: FallbackCred[] = [];
+    for (const item of list) {
+      if (!item || seen.has(loginKey(item))) continue;
+      seen.add(loginKey(item));
+      out.push(item);
+    }
+    return out;
+  }, [state.phone, state.password, state.fallbacks]);
+
+  const valid = rows.filter((row): row is AccountOk => row.ok && row.hasData);
+  const empty = rows.filter((row): row is AccountOk => row.ok && !row.hasData);
+  const errors = rows.filter((row) => !row.ok);
+  const unsupportedDomains = errors.filter((row) => row.code === "unsupported").map((row) => row.domain);
+  const siteMeta = useMemo(() => {
+    const map = new Map(sites.map((site) => [site.domain, site]));
+    return (domain: string) => map.get(domain) ?? { domain, group: "custom" as const, addedAt: null };
+  }, [sites]);
+  const orderOf = (a: AccountOk, b: AccountOk) =>
+    compareSites(siteMeta(a.domain), siteMeta(b.domain), a, b, state.sort, state.bonusMode);
+  const ranked = [...valid].sort(orderOf);
+  const quiet = [...empty].sort(orderOf);
+  const walletTotal = cents(ranked.reduce((sum, row) => sum + totalsOf(row).wallets, 0));
+  const claimableTotal = cents(ranked.reduce((sum, row) => sum + totalsOf(row).claimable, 0));
+  const waiting = cents(walletTotal + claimableTotal);
+
+  function setFallback(index: number, partial: Partial<FallbackCred>) {
+    const fallbacks = state.fallbacks.map((item, i) => (i === index ? { ...item, ...partial } : item));
+    patch({ fallbacks });
+  }
+
+  async function run(domains: string[], resumeFrom?: RunCheckpoint, mergeBase?: AccountRow[]) {
+    const unique = Array.from(new Set(domains));
+    if (!unique.length) {
+      setStatus("No sites to check. Save accounts from the list, add a domain, or scan.");
+      return;
+    }
+    const { batches, unseen } = planBatches(unique, creds, state.logins);
+    if (!batches.length) {
+      setStatus("Enter your phone number and password before fetching.");
+      return;
+    }
+    const fromPhone = onDeviceRef.current;
+    const merging = Boolean(mergeBase);
+    const previousAt = state.lastFetch?.at ?? null;
+    const previous = new Map((state.lastFetch?.rows ?? []).filter((row) => row.ok).map((row) => [row.domain, row]));
+    stopRef.current?.abort();
+    const controller = new AbortController();
+    stopRef.current = controller;
+    const collected: AccountRow[] = resumeFrom ? [...resumeFrom.rows] : mergeBase ? [...mergeBase] : [];
+    const done = resumeFrom ? [...resumeFrom.done] : [];
+    const total = resumeFrom ? sites.length : unique.length - unseen;
+    const started: LiveStats = {
+      phase: "running",
+      fromPhone,
+      done: done.length,
+      total,
+      startedAt: Date.now(),
+      finishedAt: null,
+      fetchMs: 0,
+      attempts: 0,
+      retries: 0,
+      peakQueue: 0,
+      workers: fromPhone ? START_WORKERS : Math.min(2, batches.length),
+    };
+    liveRef.current = started;
+    setLive(started);
+    setNow(started.startedAt ?? Date.now());
+    setRunning(true);
+    setShowErrors(false);
+    setDiffs([]);
+    setComparedAt(null);
+    setRows(collected);
+    setProgress({ done: done.length, total });
+    setStatus(
+      resumeFrom
+        ? `Resuming ${done.length} of ${sites.length}…`
+        : merging
+          ? `Retrying ${unique.length} unsupported sites…`
+          : unique.length === 1
+            ? `Checking ${unique[0]}…`
+            : unseen
+              ? `Checking ${total} sites that already have a saved login…`
+              : `Checking ${unique.length} sites…`,
+    );
+
+    const priorRows = overlayRows(state.lastFetch?.rows ?? [], mergeBase ?? resumeFrom?.rows ?? []);
+    let paintTimer: number | null = null;
+    let stored = true;
+    const store = () => {
+      const ok = saveFetch(overlayRows(priorRows, collected));
+      if (!ok) stored = false;
+      return ok;
+    };
+    const paint = () => {
+      const snapshot = [...collected].sort((a, b) => a.domain.localeCompare(b.domain));
+      setRows(snapshot);
+      setProgress({ done: done.length, total });
+      liveRef.current = {
+        ...liveRef.current,
+        done: done.length,
+        total,
+      };
+      setLive(liveRef.current);
+      if (!merging) {
+        const checkpoint = { at: Date.now(), done: [...done], rows: snapshot };
+        writeRun(checkpoint);
+        setPendingRun(done.length < sites.length ? checkpoint : null);
+      }
+      if (collected.length) store();
+    };
+    const publish = (batchRows: AccountRow[], loginNotes: { domain: string; login: FallbackCred | null }[]) => {
+      rememberLogins(loginNotes);
+      for (const row of batchRows) {
+        if (row.ok) rememberAccount(row.domain);
+        const index = collected.findIndex((item) => item.domain === row.domain);
+        if (index >= 0) collected[index] = row;
+        else collected.push(row);
+        if (!done.includes(row.domain)) done.push(row.domain);
+      }
+      if (fromPhone) {
+        liveRef.current = { ...liveRef.current, done: done.length, total };
+        setLive(liveRef.current);
+        setProgress({ done: done.length, total });
+        if (paintTimer == null) {
+          paintTimer = window.setTimeout(() => {
+            paintTimer = null;
+            paint();
+          }, 400);
+        }
+        return;
+      }
+      paint();
+    };
+
+    let cursor = 0;
+    if (fromPhone) {
+      const known = loadKnown(state.logins, state.lastFetch?.rows ?? []);
+      const merchants = loadMerchantMap();
+      const modes = loadModeMap();
+      let merchantTimer: number | null = null;
+      const saveMerchantState = () => {
+        try {
+          localStorage.setItem(MERCHANT_KEY, JSON.stringify(merchants));
+          localStorage.setItem(MODE_KEY, JSON.stringify(modes));
+        } catch {
+          /* ignore quota */
+        }
+      };
+      const queueMerchantState = () => {
+        if (merchantTimer != null) return;
+        merchantTimer = window.setTimeout(() => {
+          merchantTimer = null;
+          saveMerchantState();
+        }, 1000);
+      };
+      type MerchantHit = { host: string; merchantId: string };
+      type Waiter = { domain: string; resolve: (hit: MerchantHit | null) => void };
+      const waiters: Waiter[] = [];
+      let flushTimer: number | null = null;
+      const flushMerchants = () => {
+        flushTimer = null;
+        const batch = waiters.splice(0, 12);
+        if (!batch.length) return;
+        void lookupMerchants({ data: { domains: batch.map((item) => item.domain) }, signal: controller.signal })
+          .then((rows) => {
+            const byDomain = new Map(rows.map((row) => [normalizeDomain(row.domain), row]));
+            for (const waiter of batch) {
+              const row = byDomain.get(waiter.domain);
+              if (row?.merchantId && /^\d{1,12}$/.test(row.merchantId)) {
+                const hit = { host: normalizeDomain(row.host) || waiter.domain, merchantId: row.merchantId };
+                merchants[waiter.domain] = hit;
+                waiter.resolve(hit);
+              } else {
+                waiter.resolve(null);
+              }
+            }
+            queueMerchantState();
+          })
+          .catch(() => {
+            for (const waiter of batch) waiter.resolve(null);
+          })
+          .finally(() => {
+            if (waiters.length && !controller.signal.aborted) flushMerchants();
+          });
+      };
+      const merchantFor = (domain: string) => {
+        const cached = merchants[domain];
+        if (cached?.merchantId) return Promise.resolve(cached);
+        return new Promise<MerchantHit | null>((resolve) => {
+          const timer = window.setTimeout(() => resolve(null), 12_000);
+          waiters.push({
+            domain,
+            resolve: (hit) => {
+              window.clearTimeout(timer);
+              resolve(hit);
+            },
+          });
+          if (waiters.length >= 8) {
+            if (flushTimer != null) window.clearTimeout(flushTimer);
+            flushMerchants();
+            return;
+          }
+          if (flushTimer != null) return;
+          flushTimer = window.setTimeout(flushMerchants, 40);
+        });
+      };
+      const jobs = unique
+        .map((domain) => ({ domain, creds: credsFor(domain, creds, state.logins) }))
+        .filter((job) => job.creds.length);
+      let limit = START_WORKERS;
+      let active = 0;
+      let lastStart = 0;
+      let slot: Promise<void> = Promise.resolve();
+      const pause = (ms: number) =>
+        new Promise<void>((resolve, reject) => {
+          if (controller.signal.aborted) {
+            reject(new DOMException("Aborted", "AbortError"));
+            return;
+          }
+          const onAbort = () => {
+            window.clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+          };
+          const timer = window.setTimeout(() => {
+            controller.signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, ms);
+          controller.signal.addEventListener("abort", onAbort, { once: true });
+        });
+      const takeSlot = () => {
+        const run = slot.then(async () => {
+          const wait = Math.max(0, START_GAP_MS - (Date.now() - lastStart));
+          if (wait) await pause(wait);
+          lastStart = Date.now();
+        });
+        slot = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return run;
+      };
+      let knownTimer: number | null = null;
+      const queueKnown = () => {
+        if (knownTimer != null) return;
+        knownTimer = window.setTimeout(() => {
+          knownTimer = null;
+          saveKnown(known);
+        }, 1000);
+      };
+      let spawn = () => {};
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          if (active === 0 && (controller.signal.aborted || cursor >= jobs.length)) resolve();
+        };
+        spawn = () => {
+          while (!controller.signal.aborted && active < limit && cursor < jobs.length) {
+            const job = jobs[cursor];
+            cursor += 1;
+            if (!job) break;
+            active += 1;
+            liveRef.current = {
+              ...liveRef.current,
+              workers: limit,
+              peakQueue: Math.max(liveRef.current.peakQueue, active),
+            };
+            setLive(liveRef.current);
+            void (async () => {
+              const startedTry = Date.now();
+              let attempts = 0;
+              let retries = 0;
+              let last: AccountRow = { domain: job.domain, ok: false, code: "invalid_login", message: "Not your account" };
+              const finishStats = () => {
+                liveRef.current = {
+                  ...liveRef.current,
+                  fetchMs: liveRef.current.fetchMs + (Date.now() - startedTry),
+                  attempts: liveRef.current.attempts + attempts,
+                  retries: liveRef.current.retries + retries,
+                  workers: limit,
+                };
+              };
+              const attempt = async (cred: FallbackCred, only?: "id" | "blank") => {
+                await takeSlot();
+                if (controller.signal.aborted) return null;
+                attempts += 1;
+                const hit = await merchantFor(job.domain);
+                if (controller.signal.aborted) return null;
+                const merchantId = hit?.merchantId && /^\d{1,12}$/.test(hit.merchantId) ? hit.merchantId : "";
+                const used: "id" | "blank" = only === "id" && merchantId ? "id" : only === "blank" || !merchantId ? "blank" : "id";
+                try {
+                  const result = await fetchAccountOnDevice({
+                    domain: job.domain,
+                    phone: cred.phone,
+                    password: cred.password,
+                    signal: controller.signal,
+                    knownSystem: known.has(job.domain),
+                    host: hit?.host,
+                    merchantId,
+                    preferBlank: used === "blank",
+                    only: used,
+                  });
+                  return { result, used, merchantId };
+                } catch (error) {
+                  if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return null;
+                  return {
+                    result: {
+                      row: { domain: job.domain, ok: false as const, code: "other" as const, message: "Check failed" },
+                      confirmed: false,
+                      mode: null,
+                    },
+                    used,
+                    merchantId,
+                  };
+                }
+              };
+              try {
+                for (let i = 0; i < job.creds.length; i += 1) {
+                  const cred = job.creds[i];
+                  if (!cred || controller.signal.aborted) return;
+                  if (i > 0) {
+                    retries += 1;
+                    await pause(RETRY_GAP_MS);
+                  }
+                  const remembered = modes[job.domain];
+                  const first = await attempt(
+                    cred,
+                    remembered === "id" || remembered === "blank" ? remembered : undefined,
+                  );
+                  if (!first) return;
+                  if (first.result.mode) {
+                    modes[job.domain] = first.result.mode;
+                    queueMerchantState();
+                  }
+                  if (first.result.confirmed) {
+                    known.add(job.domain);
+                    queueKnown();
+                  }
+                  const row = first.result.row;
+                  if (row.ok) {
+                    finishStats();
+                    publish([row], [{ domain: job.domain, login: cred }]);
+                    return;
+                  }
+                  if (row.code === "captcha" || row.code === "timeout" || row.code !== "invalid_login") {
+                    finishStats();
+                    publish([row], []);
+                    return;
+                  }
+                  last = row;
+                }
+                finishStats();
+                publish([last], [{ domain: job.domain, login: null }]);
+              } catch (error) {
+                if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+                finishStats();
+                publish([{ domain: job.domain, ok: false, code: "other", message: "Check failed" }], []);
+              }
+            })().finally(() => {
+              active -= 1;
+              spawn();
+              finish();
+            });
+          }
+          finish();
+        };
+        spawn();
+      });
+      if (knownTimer != null) window.clearTimeout(knownTimer);
+      if (merchantTimer != null) window.clearTimeout(merchantTimer);
+      if (flushTimer != null) window.clearTimeout(flushTimer);
+      saveKnown(known);
+      saveMerchantState();
+    } else {
+    const vaultLimit = Math.min(2, batches.length);
+    let vaultActive = 0;
+    const noteVault = (delta: number) => {
+      vaultActive = Math.max(0, vaultActive + delta);
+      liveRef.current = {
+        ...liveRef.current,
+        workers: vaultActive,
+        peakQueue: Math.max(liveRef.current.peakQueue, vaultActive),
+      };
+      setLive(liveRef.current);
+    };
+    const worker = async () => {
+      for (;;) {
+        if (controller.signal.aborted) return;
+        const index = cursor;
+        cursor += 1;
+        if (index >= batches.length) return;
+        const batch = batches[index];
+        if (!batch) return;
+        noteVault(1);
+        try {
+        let pending = batch.domains;
+        const settled = new Map<string, AccountRow>();
+        const loginNotes: { domain: string; login: FallbackCred | null }[] = [];
+        try {
+          for (const cred of batch.creds) {
+            if (controller.signal.aborted || !pending.length) break;
+            const startedTry = Date.now();
+            const result = await fetchBatch({
+                  data: { domains: pending, phone: cred.phone, password: cred.password },
+                  signal: controller.signal,
+                });
+            const retry: string[] = [];
+            const returned = new Set(result.map((row) => row.domain));
+            for (const row of result) {
+              if (row.ok) {
+                settled.set(row.domain, row);
+                loginNotes.push({ domain: row.domain, login: cred });
+              } else if (row.code !== "invalid_login") {
+                settled.set(row.domain, row);
+              } else {
+                retry.push(row.domain);
+              }
+            }
+            for (const domain of pending) {
+              if (!returned.has(domain) && !settled.has(domain)) retry.push(domain);
+            }
+            liveRef.current = {
+              ...liveRef.current,
+              fetchMs: liveRef.current.fetchMs + (Date.now() - startedTry),
+              attempts: liveRef.current.attempts + Math.max(result.length, pending.length),
+              retries: liveRef.current.retries + retry.length,
+              workers: vaultActive,
+              peakQueue: Math.max(liveRef.current.peakQueue, vaultActive),
+            };
+            setLive(liveRef.current);
+            pending = retry;
+          }
+        } catch (error) {
+          if (controller.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) return;
+          for (const domain of pending) {
+            if (!settled.has(domain)) settled.set(domain, { domain, ok: false, code: "other", message: "Check failed" });
+          }
+          pending = [];
+        }
+        if (controller.signal.aborted) return;
+        for (const domain of pending) {
+          settled.set(domain, { domain, ok: false, code: "invalid_login", message: "Not your account" });
+          loginNotes.push({ domain, login: null });
+        }
+        publish(
+          batch.domains.map((domain) => settled.get(domain) ?? { domain, ok: false, code: "other", message: "Check failed" }),
+          loginNotes,
+        );
+        } finally {
+          noteVault(-1);
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: vaultLimit }, () => worker()));
+    }
+    if (paintTimer != null) {
+      window.clearTimeout(paintTimer);
+      paintTimer = null;
+    }
+    paint();
+    const stopped = controller.signal.aborted;
+    const finalRows = [...collected].sort((a, b) => a.domain.localeCompare(b.domain));
+    setRows(finalRows);
+    if (stored && !merging && !stopped && done.length >= sites.length) {
+      try {
+        localStorage.removeItem(RUN_KEY);
+      } catch {
+        /* ignore */
+      }
+      setPendingRun(null);
+    }
+    const notes: ChangeNote[] = [];
+    for (const row of finalRows) {
+      if (!row.ok) continue;
+      notes.push(...changesFor(previous.get(row.domain), row));
+    }
+    notes.sort(
+      (a, b) =>
+        Math.abs((b.to ?? 0) - (b.from ?? 0)) - Math.abs((a.to ?? 0) - (a.from ?? 0)) ||
+        a.domain.localeCompare(b.domain),
+    );
+    setDiffs(notes);
+    setComparedAt(previousAt);
+    const signedIn = finalRows.filter((row) => row.ok).length;
+    liveRef.current = {
+      ...liveRef.current,
+      phase: stopped ? "stopped" : "done",
+      finishedAt: Date.now(),
+      done: done.length,
+    };
+    setLive(liveRef.current);
+    const counts: Record<string, number> = {};
+    for (const row of finalRows) {
+      if (row.ok) continue;
+      counts[row.code] = (counts[row.code] ?? 0) + 1;
+    }
+    const report: FetchRunReport = {
+      at: liveRef.current.finishedAt ?? Date.now(),
+      source: fromPhone ? "phone" : "vault",
+      total: finalRows.length,
+      signedIn,
+      rejected: finalRows.length - signedIn,
+      attempts: liveRef.current.attempts,
+      retries: liveRef.current.retries,
+      workers: liveRef.current.workers,
+      peak: liveRef.current.peakQueue,
+      wallMs: liveRef.current.startedAt ? (liveRef.current.finishedAt ?? Date.now()) - liveRef.current.startedAt : 0,
+      counts,
+      signedInDomains: finalRows.filter((row) => row.ok).map((row) => row.domain).slice(0, 40),
+    };
+    void recordFetchRun({ data: report })
+      .then(() => listFetchRuns())
+      .then((runs) => setSharedRuns(runs))
+      .catch(() => undefined);
+    setStatus(
+      !stored
+        ? "Finished, but this phone could not store the result. Leave the app open and try the fetch again."
+        : stopped
+          ? "Stopped. Successful sign-ins stay in My accounts."
+          : `Done. ${signedIn} of ${finalRows.length} signed in. Only those are kept as your accounts.`,
+    );
+    setRunning(false);
+  }
+
+  const allowed = new Set(sites.map((site) => site.domain));
+  const mineTargets = (state.mine.length
+    ? state.mine
+    : sites.filter((site) => state.visited.includes(site.domain)).map((site) => site.domain)
+  ).filter((domain) => allowed.has(domain));
+
+  return (
+    <section className="stack" data-fetch-from={onDevice ? "phone" : "server"}>
+      <Link to="/" className="hint" style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+        <ChevronLeft size={16} /> Back to the list
+      </Link>
+      <div>
+        <h1 className="brand grad-text" style={{ fontSize: "1.7rem" }}>
+          Fetch bonus data
+        </h1>
+        <p className="hint">
+          Sign-in stays on this device. Four sites run at once. The vault only reads each site's public
+          merchant number, then this phone signs in. If that number is rejected, it tries once without it
+          and remembers which one worked. The password is not sent through the vault.
+        </p>
+        {Object.keys(state.logins).length ? (
+          <p className="hint">{Object.keys(state.logins).length} sites have a saved login.</p>
+        ) : null}
+      </div>
+
+      <div className="panel stack">
+        <label className="field">
+          <span>Phone number</span>
+          <input
+            className="text-input"
+            inputMode="tel"
+            autoComplete="username"
+            value={state.phone}
+            placeholder="04…"
+            onChange={(event) => patch({ phone: event.target.value })}
+          />
+        </label>
+        <label className="field">
+          <span>Password</span>
+          <div className="pass-row">
+            <input
+              className="text-input"
+              type={showPassword ? "text" : "password"}
+              autoComplete="current-password"
+              value={state.password}
+              onChange={(event) => patch({ password: event.target.value })}
+            />
+            <button
+              type="button"
+              className="btn"
+              aria-label={showPassword ? "Hide password" : "Show password"}
+              onClick={() => setShowPassword((value) => !value)}
+            >
+              {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+            </button>
+          </div>
+        </label>
+        <button type="button" className="btn btn-ghost" onClick={() => setAdvanced((value) => !value)}>
+          {advanced ? "Hide fallback logins" : "Fallback logins"}
+        </button>
+        {advanced
+          ? state.fallbacks.map((item, index) => (
+              <div className="stack" key={index}>
+                <label className="field">
+                  <span>Fallback {index + 2} phone</span>
+                  <input
+                    className="text-input"
+                    value={item.phone}
+                    inputMode="tel"
+                    onChange={(event) => setFallback(index, { phone: event.target.value })}
+                  />
+                </label>
+                <label className="field">
+                  <span>Fallback {index + 2} password</span>
+                  <input
+                    className="text-input"
+                    type="password"
+                    value={item.password}
+                    onChange={(event) => setFallback(index, { password: event.target.value })}
+                  />
+                </label>
+              </div>
+            ))
+          : null}
+        <p className="hint">
+          Saved only in this browser. Sign-in goes from this browser, so the casino sees the address below.
+        </p>
+        <div className="actions">
+          <button
+            type="button"
+            className="btn btn-grad"
+            disabled={running}
+            onClick={() => void run(mineTargets)}
+          >
+            {running ? <Loader2 size={16} /> : null} Fetch my accounts
+            {mineTargets.length ? ` (${mineTargets.length})` : ""}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={running || unsupportedDomains.length === 0}
+            onClick={() => void run(unsupportedDomains, undefined, rows)}
+          >
+            Retry unsupported{unsupportedDomains.length ? ` (${unsupportedDomains.length})` : ""}
+          </button>
+          <button type="button" className="btn" disabled={!running} onClick={() => stopRef.current?.abort()}>
+            Stop
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={running || !state.lastFetch}
+            onClick={() => {
+              setRows(state.lastFetch?.rows ?? []);
+              setDiffs([]);
+              setComparedAt(null);
+              setStatus("Showing the last fetch saved on this device.");
+            }}
+          >
+            View last fetch
+          </button>
+        </div>
+        <div className="check-row">
+          <input
+            className="text-input"
+            value={single}
+            placeholder="Check one site, e.g. 9au.com"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            onChange={(event) => setSingle(event.target.value)}
+          />
+          <button
+            type="button"
+            className="btn"
+            disabled={running}
+            onClick={() => {
+              const domain = normalizeDomain(single);
+              if (!isPublicDomain(domain)) {
+                setStatus("Enter a domain like 9au.com");
+                return;
+              }
+              void run([domain]);
+            }}
+          >
+            Check
+          </button>
+        </div>
+        <button type="button" className="btn btn-ghost" disabled={running} onClick={() => setConfirmScan(true)}>
+          Scan the full list to find my accounts
+        </button>
+        {pendingRun && !running ? (
+          <>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                const done = new Set(pendingRun.done);
+                const remaining = sites.map((site) => site.domain).filter((domain) => !done.has(domain));
+                void run(remaining, pendingRun);
+              }}
+            >
+              Resume scan ({pendingRun.done.length} of {sites.length})
+            </button>
+            <button
+              type="button"
+              className="btn"
+              onClick={() => {
+                try {
+                  localStorage.removeItem(RUN_KEY);
+                } catch {
+                  /* ignore */
+                }
+                setPendingRun(null);
+                setRows(state.lastFetch?.rows ?? []);
+                setDiffs([]);
+                setComparedAt(null);
+                setProgress({ done: 0, total: 0 });
+                setLive(IDLE_LIVE);
+                setStatus("Cleared the stopped run. Saved accounts are unchanged.");
+              }}
+            >
+              Clear current run
+            </button>
+          </>
+        ) : null}
+        <div className="ip-card ip-card-local">
+          <div className="ip-card-top">
+            <p className="ip-card-title">
+              Outgoing IP: {outgoingLoading ? "Checking…" : outgoing?.ip || "—"}
+            </p>
+            <span className="ip-badge">Local device IP</span>
+            <button
+              type="button"
+              className="ip-refresh"
+              aria-label="Check the outgoing IP again"
+              onClick={() => setOutgoingTick((value) => value + 1)}
+            >
+              <RefreshCw size={16} className={outgoingLoading ? "spin" : undefined} />
+            </button>
+          </div>
+          <p className="ip-card-line">
+            <span className="ip-dot" aria-hidden="true" />
+            {outgoing ? [outgoing.isp, outgoing.place].filter(Boolean).join(" · ") : outgoingError || "Reading the address casinos will see"}
+          </p>
+          <p className="ip-card-line">
+            <span className="ip-check" aria-hidden="true" />
+            Sign-in from this browser · casinos see this IP
+          </p>
+        </div>
+        <div className="panel live-fetch">
+          <h2 className="section-label">Live fetch</h2>
+          <p className="live-via">{viaLabel(live.phase === "idle" ? onDevice : live.fromPhone)}</p>
+          <p className="live-count">
+            {live.phase === "idle" ? 0 : live.done} / {live.total} processed · {live.total ? Math.round(((live.phase === "idle" ? 0 : live.done) / live.total) * 100) : 0}%
+          </p>
+          <p className="live-meta">
+            {live.phase === "running" ? "Running" : live.phase === "done" ? "Done" : live.phase === "stopped" ? "Stopped" : "Idle"}
+          </p>
+          <p className="live-meta">
+            {live.phase === "idle" ? 0 : rows.filter((row) => row.ok).length} signed in · {live.phase === "idle" ? 0 : errors.length} rejected · {live.phase === "idle" ? 0 : ranked.length} with a balance · {live.phase === "idle" ? 0 : quiet.length} nothing waiting
+          </p>
+          <p className="live-meta">
+            Queue {Math.max(0, live.total - (live.phase === "idle" ? 0 : live.done))} · workers {live.workers} · peak {live.peakQueue}
+          </p>
+          <p className="live-meta">
+            Wall {live.startedAt ? formatSpan((live.finishedAt ?? now) - live.startedAt) : "0s"} · sign-in {formatSpan(live.fetchMs)}
+          </p>
+          <p className="live-meta">
+            Retries {live.retries} · attempts {live.attempts}
+          </p>
+        </div>
+        {sharedRuns.length ? (
+          <div className="panel">
+            <h2 className="section-label">Runs from phone and browser</h2>
+            <ul className="diff">
+              {sharedRuns.slice(0, 8).map((run) => (
+                <li key={run.at}>
+                  <span className="diff-copy">
+                    <strong>{run.source === "phone" ? "Phone" : "Vault"}</strong>
+                    <span>
+                      {run.signedIn} signed in · {run.rejected} rejected · {run.total} sites
+                    </span>
+                  </span>
+                  <span>{formatAdded(new Date(run.at).toISOString())}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        <p className="progress-line">{viaLabel(live.phase === "idle" ? onDevice : live.fromPhone)}. {status}</p>
+        {progress.total > 0 ? (
+          <div className="bar" aria-hidden="true">
+            <span style={{ width: `${Math.round((progress.done / progress.total) * 100)}%` }} />
+          </div>
+        ) : null}
+      </div>
+
+      {comparedAt != null ? (
+        <div className="panel">
+          <strong>Changes since {formatAdded(new Date(comparedAt).toISOString())}</strong>
+          {diffs.length ? (
+            <ul className="diff">
+              {diffs.map((note) => (
+                <li key={note.id}>
+                  <span className="diff-copy">
+                    <strong>{note.domain}</strong>
+                    <span>{note.label}</span>
+                  </span>
+                  <span className={deltaClass(note)}>{deltaText(note)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="hint">No change in wallets or claimable bonuses.</p>
+          )}
+        </div>
+      ) : null}
+
+      <div className="result-summary">
+        <h2 className="section-label">Your accounts · {ranked.length}</h2>
+        {ranked.length ? (
+          <>
+            <p className="waiting">
+              {money(waiting)} <span>waiting</span>
+            </p>
+            <p className="hint waiting-split">
+              Wallets {money(walletTotal)} + claimable {money(claimableTotal)}
+            </p>
+          </>
+        ) : null}
+        {state.lastFetch && !running ? (
+          <p className="hint waiting-split">Saved {formatAdded(new Date(state.lastFetch.at).toISOString())}</p>
+        ) : null}
+        {ranked.length ? <PageList rows={ranked} addedAt={(domain) => siteMeta(domain).addedAt} /> : <p className="hint">Nothing with a balance or bonus yet.</p>}
+      </div>
+      <div>
+        <h2 className="section-label">Signed in, nothing waiting · {empty.length}</h2>
+        {quiet.length ? <PageList rows={quiet} addedAt={(domain) => siteMeta(domain).addedAt} /> : <p className="hint">None.</p>}
+      </div>
+      <div>
+        <h2 className="section-label">Not your account or unreachable · {errors.length}</h2>
+        {errors.length ? (
+          <>
+            <button type="button" className="btn" onClick={() => setShowErrors((value) => !value)}>
+              {showErrors ? "Hide" : "Show"} rejected sites
+            </button>
+            {showErrors ? (
+              <div className="stack" style={{ marginTop: 8 }}>
+                {errors.map((row) => (
+                  <div className="result-card error-row" key={row.domain}>
+                    <SiteIcon domain={row.domain} />
+                    <div>
+                      <strong>{row.domain}</strong>
+                      <p className="hint">{row.message}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </>
+        ) : (
+          <p className="hint">None this fetch. Rejected sites stay saved under Needs attention.</p>
+        )}
+      </div>
+
+      <NeedsAttention
+        savedAt={state.lastFetch?.at ?? null}
+        rows={(state.lastFetch?.rows ?? []).filter((row): row is AccountErr => !row.ok)}
+        marks={state.attentionChecked}
+        onToggle={(domain, code) => {
+          const marks = state.attentionChecked;
+          const exists = marks.some((mark) => mark.domain === domain && mark.code === code);
+          patch({
+            attentionChecked: exists
+              ? marks.filter((mark) => !(mark.domain === domain && mark.code === code))
+              : [...marks, { domain, code }],
+          });
+        }}
+      />
+
+      {confirmScan ? (
+        <div className="modal-backdrop" onClick={() => setConfirmScan(false)}>
+          <div className="modal-card stack" onClick={(event) => event.stopPropagation()}>
+            <h3>Scan every listed site?</h3>
+            <p className="hint">
+              Sites that already signed in use that saved login. The rest try the phone and password above.
+              You can stop it at any time.
+            </p>
+            <div className="actions">
+              <button type="button" className="btn" onClick={() => setConfirmScan(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn btn-grad"
+                onClick={() => {
+                  setConfirmScan(false);
+                  void run(sites.map((site) => site.domain));
+                }}
+              >
+                Scan my login
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+    </section>
+  );
+}
