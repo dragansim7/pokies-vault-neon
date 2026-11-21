@@ -9,13 +9,14 @@ import kotlinx.coroutines.sync.withLock
 
 /**
  * Adaptive coroutine concurrency limiter (AIMD-style) with live active and peak worker telemetry.
- * Starts at [initialLimit] (6), scales up to [maxLimit] (8) on sustained healthy responses,
- * and scales down toward [minLimit] (3) when rate-limit (429) or timeout bursts occur.
+ * Configured per FetchSpeedPreset (default Safe: 1..3 workers, starting at 2).
+ * Scales up cautiously (+1 after 10 consecutive healthy domains) and steps down immediately
+ * on firewall/rate-limit/timeout congestion.
  */
 class AdaptiveConcurrencyController(
-    private val minLimit: Int = 3,
-    initialLimit: Int = 6,
-    private val maxLimit: Int = 8
+    private var minLimit: Int = 1,
+    initialLimit: Int = 2,
+    private var maxLimit: Int = 3
 ) {
     private val mutex = Mutex()
     private var inFlight: Int = 0
@@ -57,7 +58,7 @@ class AdaptiveConcurrencyController(
                 }
             }
             if (granted) return
-            delay(18L)
+            delay(25L)
         }
     }
 
@@ -71,7 +72,7 @@ class AdaptiveConcurrencyController(
     suspend fun recordHealthy() {
         mutex.withLock {
             consecutiveHealthy++
-            if (consecutiveHealthy >= 6 && targetLimit < maxLimit) {
+            if (consecutiveHealthy >= 10 && targetLimit < maxLimit) {
                 targetLimit++
                 consecutiveHealthy = 0
                 _currentLimit.value = targetLimit
@@ -89,9 +90,11 @@ class AdaptiveConcurrencyController(
         }
     }
 
-    suspend fun reset(limit: Int = 6) {
+    suspend fun reset(min: Int = 1, initial: Int = 2, max: Int = 3) {
         mutex.withLock {
-            targetLimit = limit.coerceIn(minLimit, maxLimit)
+            minLimit = min.coerceAtLeast(1)
+            maxLimit = max.coerceAtLeast(minLimit)
+            targetLimit = initial.coerceIn(minLimit, maxLimit)
             consecutiveHealthy = 0
             peakObserved = 0
             _peakWorkers.value = 0

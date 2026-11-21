@@ -57,9 +57,12 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aistudio.pokiesvault.R
 import com.aistudio.pokiesvault.ui.components.AccountResultCard
 import com.aistudio.pokiesvault.ui.components.EmptyStateCard
+import com.aistudio.pokiesvault.ui.components.GroupedRejectedSection
 import com.aistudio.pokiesvault.ui.components.LiveFetchStatsCard
 import com.aistudio.pokiesvault.ui.components.OutgoingIpCard
 import com.aistudio.pokiesvault.ui.components.ResponsibleGamblingFooter
+import com.aistudio.pokiesvault.ui.components.SpeedPresetSelector
+import com.aistudio.pokiesvault.ui.components.WafPauseAndCheckpointBanner
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
 import com.aistudio.pokiesvault.ui.viewmodel.VaultViewModel
@@ -146,7 +149,24 @@ fun FetcherScreen(
                 Spacer(modifier = Modifier.height(12.dp))
             }
 
-            // Credentials + Concurrency Console Card
+            // Actionable WAF Auto-Pause or Saved Checkpoint Banner
+            val checkpoint = state.activeCheckpoint
+            if (checkpoint != null && !state.isFetching) {
+                item(key = "fetcher_checkpoint_banner") {
+                    WafPauseAndCheckpointBanner(
+                        checkpoint = checkpoint,
+                        currentIp = egressState.info?.ip,
+                        isRefreshingIp = egressState.isLoading,
+                        isFetching = state.isFetching,
+                        onRefreshIp = { viewModel.refreshOutgoingIp() },
+                        onResume = { viewModel.resumeCheckpoint() },
+                        onDiscard = { viewModel.discardCheckpoint() }
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+            }
+
+            // Credentials + Speed Preset + Concurrency Console Card
             item(key = "fetcher_controls") {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -162,7 +182,7 @@ fun FetcherScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "ADAPTIVE POOL · ${state.workerLimit} MAX WORKERS",
+                                text = "${state.speedPreset.displayName.uppercase()} POOL · ${state.workerLimit} MAX WORKERS",
                                 color = palette.accentA,
                                 style = MonoTextStyles.metricSmall,
                                 fontWeight = FontWeight.Bold
@@ -178,6 +198,15 @@ fun FetcherScreen(
                         }
 
                         Spacer(modifier = Modifier.height(10.dp))
+
+                        // Selectable Speed Preset (Gentle / Safe / Balanced)
+                        SpeedPresetSelector(
+                            selected = state.speedPreset,
+                            enabled = !state.isFetching,
+                            onSelect = { viewModel.setFetchSpeedPreset(it) }
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
 
                         Text("Phone number", style = MaterialTheme.typography.labelMedium)
                         Spacer(modifier = Modifier.height(4.dp))
@@ -534,69 +563,18 @@ fun FetcherScreen(
                 }
             }
 
-            // Section 3: Rejected / Partial Failures
-            if (state.rejectedAccounts.isNotEmpty()) {
-                item(key = "section_rejected_header") {
+            // Section 3: Grouped Rejected / Partial Failures
+            if (state.rejectedGroups.isNotEmpty()) {
+                item(key = "section_rejected_grouped") {
                     Spacer(modifier = Modifier.height(16.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "REJECTED OR UNREACHABLE · ${state.rejectedAccounts.size}",
-                            color = palette.dead,
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        TextButton(
-                            onClick = { viewModel.setShowRejectedSites(!state.showRejectedSites) },
-                            modifier = Modifier.testTag("toggle_rejected_btn")
-                        ) {
-                            Text(
-                                text = if (state.showRejectedSites) "Hide" else "Show all",
-                                color = palette.accentA
-                            )
-                        }
-                    }
-                }
-
-                if (state.showRejectedSites) {
-                    items(items = state.rejectedAccounts, key = { "err_${it.domain}" }) { err ->
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 3.dp),
-                            shape = MaterialTheme.shapes.small,
-                            color = MaterialTheme.colorScheme.surfaceVariant
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 12.dp, vertical = 9.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = err.domain,
-                                        color = MaterialTheme.colorScheme.onSurface,
-                                        style = MaterialTheme.typography.titleSmall
-                                    )
-                                    Text(
-                                        text = err.message,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                                Text(
-                                    text = err.code.uppercase(),
-                                    color = palette.dead,
-                                    style = MonoTextStyles.metricSmall
-                                )
-                            }
-                        }
-                    }
+                    GroupedRejectedSection(
+                        groups = state.rejectedGroups,
+                        totalRejected = state.rejectedAccounts.size,
+                        retryableCount = state.retryableDomains.size,
+                        isFetching = state.isFetching,
+                        onRetryCode = { code -> viewModel.retryRejectedCode(code) },
+                        onRetryAllRecoverable = { viewModel.retryFailedFetches() }
+                    )
                 }
             }
 

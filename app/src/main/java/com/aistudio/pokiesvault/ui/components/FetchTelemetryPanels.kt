@@ -299,8 +299,18 @@ fun LiveFetchStatsCard(
 
             Text(
                 text = state.liveStatusLabel,
-                color = if (state.isFetching) palette.accentA else MaterialTheme.colorScheme.onSurfaceVariant,
+                color = when {
+                    state.isFetching -> palette.accentA
+                    state.liveStatusLabel.contains("WAF", ignoreCase = true) -> palette.slow
+                    state.liveStatusLabel.startsWith("Paused", ignoreCase = true) -> palette.accentA
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
                 style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (state.liveStatusLabel.contains("WAF", ignoreCase = true)) {
+                    FontWeight.SemiBold
+                } else {
+                    FontWeight.Normal
+                },
                 modifier = Modifier.testTag("live_fetch_status_line")
             )
 

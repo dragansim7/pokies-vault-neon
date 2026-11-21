@@ -15,7 +15,9 @@ import com.aistudio.pokiesvault.data.model.BonusMode
 import com.aistudio.pokiesvault.data.model.CatalogSite
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.FallbackCred
+import com.aistudio.pokiesvault.data.model.FetchCheckpoint
 import com.aistudio.pokiesvault.data.model.FetchRunSummary
+import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusSiteCache
 import com.aistudio.pokiesvault.data.model.SiteGroup
@@ -58,6 +60,7 @@ class VaultRepository(private val context: Context) {
 
     val preferencesFlow: Flow<VaultPreferences> = prefsStore.preferencesFlow
     val credentialsFlow: Flow<VaultCredentials> = prefsStore.credentialsFlow
+    val checkpointFlow: Flow<FetchCheckpoint?> = prefsStore.checkpointFlow
     val hiddenCountFlow: Flow<Int> = dao.observeHiddenCount()
 
     val visibleSitesFlow: Flow<List<SiteRecord>> = dao.observeVisibleSites().map { entities ->
@@ -231,6 +234,9 @@ class VaultRepository(private val context: Context) {
     suspend fun setNotVisited(enabled: Boolean) = prefsStore.setNotVisited(enabled)
     suspend fun setWallets(enabled: Boolean) = prefsStore.setWallets(enabled)
     suspend fun setMineOnly(enabled: Boolean) = prefsStore.setMineOnly(enabled)
+    suspend fun setFetchSpeedPreset(preset: FetchSpeedPreset) = prefsStore.setFetchSpeedPreset(preset)
+    suspend fun saveCheckpoint(checkpoint: FetchCheckpoint) = prefsStore.saveCheckpoint(checkpoint)
+    suspend fun clearCheckpoint() = prefsStore.clearCheckpoint()
     suspend fun saveCredentials(credentials: VaultCredentials) = prefsStore.saveCredentials(credentials)
 
     // --- Unified Domain Management ---

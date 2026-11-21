@@ -10,6 +10,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.aistudio.pokiesvault.data.model.BonusMode
 import com.aistudio.pokiesvault.data.model.FallbackCred
+import com.aistudio.pokiesvault.data.model.FetchCheckpoint
+import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.data.model.SortMode
 import com.aistudio.pokiesvault.data.model.VaultCredentials
 import com.aistudio.pokiesvault.data.model.VaultPreferences
@@ -39,6 +41,8 @@ class VaultPreferencesStore(private val context: Context) {
         val NOT_VISITED = booleanPreferencesKey("not_visited")
         val WALLETS = booleanPreferencesKey("wallets")
         val MINE_ONLY = booleanPreferencesKey("mine_only")
+        val FETCH_SPEED_PRESET = stringPreferencesKey("fetch_speed_preset")
+        val FETCH_CHECKPOINT_JSON = stringPreferencesKey("fetch_checkpoint_json_v1")
         val ENCRYPTED_CREDS = stringPreferencesKey("encrypted_credentials_v1")
     }
 
@@ -54,8 +58,26 @@ class VaultPreferencesStore(private val context: Context) {
                 bonusMode = enumOrDefault(prefs[Keys.BONUS_MODE], BonusMode.NONE),
                 notVisited = prefs[Keys.NOT_VISITED] ?: false,
                 wallets = prefs[Keys.WALLETS] ?: true,
-                mineOnly = prefs[Keys.MINE_ONLY] ?: false
+                mineOnly = prefs[Keys.MINE_ONLY] ?: false,
+                fetchSpeedPreset = enumOrDefault(prefs[Keys.FETCH_SPEED_PRESET], FetchSpeedPreset.SAFE)
             )
+        }
+
+    val checkpointFlow: Flow<FetchCheckpoint?> = context.vaultDataStore.data
+        .catch { ex ->
+            if (ex is IOException) emit(emptyPreferences()) else throw ex
+        }
+        .map { prefs ->
+            val raw = prefs[Keys.FETCH_CHECKPOINT_JSON]
+            if (raw.isNullOrBlank()) {
+                null
+            } else {
+                try {
+                    json.decodeFromString<FetchCheckpoint>(raw)
+                } catch (_: Exception) {
+                    null
+                }
+            }
         }
 
     val credentialsFlow: Flow<VaultCredentials> = context.vaultDataStore.data
@@ -107,6 +129,19 @@ class VaultPreferencesStore(private val context: Context) {
 
     suspend fun setMineOnly(enabled: Boolean) {
         context.vaultDataStore.edit { it[Keys.MINE_ONLY] = enabled }
+    }
+
+    suspend fun setFetchSpeedPreset(preset: FetchSpeedPreset) {
+        context.vaultDataStore.edit { it[Keys.FETCH_SPEED_PRESET] = preset.name }
+    }
+
+    suspend fun saveCheckpoint(checkpoint: FetchCheckpoint) {
+        val encoded = json.encodeToString(checkpoint)
+        context.vaultDataStore.edit { it[Keys.FETCH_CHECKPOINT_JSON] = encoded }
+    }
+
+    suspend fun clearCheckpoint() {
+        context.vaultDataStore.edit { it.remove(Keys.FETCH_CHECKPOINT_JSON) }
     }
 
     suspend fun saveCredentials(credentials: VaultCredentials) {

@@ -232,6 +232,66 @@ data class FetchRunSummary(
     val totalCash: Double
 )
 
+@Serializable
+enum class FetchSpeedPreset(
+    val displayName: String,
+    val subtitle: String,
+    val minWorkers: Int,
+    val initialWorkers: Int,
+    val maxWorkers: Int,
+    val startGapMs: Long,
+    val jitterMs: Long
+) {
+    GENTLE(
+        displayName = "Gentle",
+        subtitle = "1–2 workers · 1.5s gap",
+        minWorkers = 1,
+        initialWorkers = 1,
+        maxWorkers = 2,
+        startGapMs = 1500L,
+        jitterMs = 450L
+    ),
+    SAFE(
+        displayName = "Safe",
+        subtitle = "2–3 workers · 750ms gap",
+        minWorkers = 1,
+        initialWorkers = 2,
+        maxWorkers = 3,
+        startGapMs = 750L,
+        jitterMs = 250L
+    ),
+    BALANCED(
+        displayName = "Balanced",
+        subtitle = "3–5 workers · 450ms gap",
+        minWorkers = 2,
+        initialWorkers = 3,
+        maxWorkers = 5,
+        startGapMs = 450L,
+        jitterMs = 150L
+    )
+}
+
+@Serializable
+enum class CheckpointPauseReason {
+    WAF_BLOCKED,
+    USER_STOPPED,
+    INTERRUPTED
+}
+
+@Serializable
+data class FetchCheckpoint(
+    val runStartedAt: Long,
+    val allTargetDomains: List<String>,
+    val completedDomains: List<String>,
+    val remainingDomains: List<String>,
+    val pauseReason: CheckpointPauseReason,
+    val pausedAtIp: String? = null,
+    val pauseDetail: String = "",
+    val elapsedWallSec: Long = 0L,
+    val partialRunId: Long? = null,
+    val savedAt: Long = 0L
+)
+
 data class VaultPreferences(
     val themeId: VaultThemeId = VaultThemeId.VAULT,
     val viewMode: ViewMode = ViewMode.GROUPS,
@@ -239,7 +299,8 @@ data class VaultPreferences(
     val bonusMode: BonusMode = BonusMode.NONE,
     val notVisited: Boolean = false,
     val wallets: Boolean = true,
-    val mineOnly: Boolean = false
+    val mineOnly: Boolean = false,
+    val fetchSpeedPreset: FetchSpeedPreset = FetchSpeedPreset.SAFE
 )
 
 @Serializable

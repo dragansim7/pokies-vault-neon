@@ -48,7 +48,8 @@ data class PublicCatalogueResult(
 data class AccountFetchOutcome(
     val result: AccountResult,
     val discoveredTarget: HostTarget? = null,
-    val congested: Boolean = false
+    val congested: Boolean = false,
+    val wafSignal: Boolean = false
 )
 
 class CasinoApiService {
@@ -332,28 +333,21 @@ class CasinoApiService {
             )
         }
 
-        // Resolve host + merchantId via cache first, falling back to streaming HTML inspection.
-        // A blocked/blank homepage never stops direct login attempts (plain mode fallback).
-        var target = cachedTarget
+        // Direct API-first login:
+        // 1. If Room host cache already has a valid merchantId, use it immediately with Origin/Referer.
+        // 2. Otherwise, attempt direct blank-mode login on /api/v1/index.php WITHOUT scraping the homepage HTML.
+        // 3. Only fall back to a single discoverHostTarget(domain) HTML scrape if the API explicitly asks for merchantId.
+        var host = cachedTarget?.host?.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
+        var merchantId = cachedTarget?.merchantId ?: ""
+        var useSelfHeaders = merchantId.isNotEmpty()
         var newlyDiscovered: HostTarget? = null
-        if (target == null || target.merchantId.isBlank()) {
-            val inspected = discoverHostTarget(domain)
-            if (inspected != null) {
-                target = inspected
-                newlyDiscovered = inspected
-            }
-        }
-
-        val host = target?.host?.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
-        val merchantId = target?.merchantId ?: ""
-        val useSelfHeaders = merchantId.isNotEmpty()
 
         var retriesUsed = 0
         var congested = false
 
-        val loginFields = mapOf(
+        fun buildLoginFields(mid: String): Map<String, String> = mapOf(
             "module" to "/users/login",
-            "merchantId" to merchantId,
+            "merchantId" to mid,
             "accessId" to "",
             "accessToken" to "",
             "walletIsAdmin" to "",
@@ -361,27 +355,77 @@ class CasinoApiService {
             "password" to passwordRaw
         )
 
-        val loginResult = executeWithRetry(
+        var loginResult = executeWithRetry(
+            maxRetries = 1,
             onRetry = { retriesUsed++ },
             onCongestion = { congested = true }
         ) {
-            postApi(host, loginFields, useSelfHeaders)
+            postApi(host, buildLoginFields(merchantId), useSelfHeaders)
         }
 
-        val loginJson = loginResult.getOrElse { ex ->
+        var loginJson = loginResult.getOrElse { ex ->
             val elapsed = System.currentTimeMillis() - started
             val err = classifyFailure(domain, ex.message ?: "Could not reach site", elapsed, retriesUsed)
-            return@withContext AccountFetchOutcome(err, newlyDiscovered, congested || err.code == "timeout")
+            val isWaf = isWafErrorCode(err.code)
+            return@withContext AccountFetchOutcome(
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf || err.code == "timeout",
+                wafSignal = isWaf
+            )
+        }
+
+        // Lazy homepage discovery fallback ONLY if blank-mode login explicitly complains about merchantId
+        if (loginJson.optString("status") != "SUCCESS" && merchantId.isEmpty()) {
+            val firstMsg = (loginJson.optJSONObject("data")?.optString("message")
+                ?: loginJson.optString("message", "")).lowercase(Locale.US)
+            val needsMerchantDiscovery = (firstMsg.contains("merchant") || firstMsg.contains("missing")) &&
+                !firstMsg.contains("invalid login") &&
+                !firstMsg.contains("invalid password") &&
+                !firstMsg.contains("captcha") &&
+                !firstMsg.contains("blocked")
+
+            if (needsMerchantDiscovery) {
+                val inspected = discoverHostTarget(domain)
+                if (inspected != null && inspected.merchantId.isNotBlank()) {
+                    newlyDiscovered = inspected
+                    host = inspected.host.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
+                    merchantId = inspected.merchantId
+                    useSelfHeaders = true
+
+                    loginResult = executeWithRetry(
+                        maxRetries = 1,
+                        onRetry = { retriesUsed++ },
+                        onCongestion = { congested = true }
+                    ) {
+                        postApi(host, buildLoginFields(merchantId), useSelfHeaders)
+                    }
+                    loginJson = loginResult.getOrElse { ex ->
+                        val elapsed = System.currentTimeMillis() - started
+                        val err = classifyFailure(domain, ex.message ?: "Could not reach site", elapsed, retriesUsed)
+                        val isWaf = isWafErrorCode(err.code)
+                        return@withContext AccountFetchOutcome(
+                            result = err,
+                            discoveredTarget = newlyDiscovered,
+                            congested = congested || isWaf || err.code == "timeout",
+                            wafSignal = isWaf
+                        )
+                    }
+                }
+            }
         }
 
         if (loginJson.optString("status") != "SUCCESS") {
             val dataObj = loginJson.optJSONObject("data")
             val msg = dataObj?.optString("message") ?: loginJson.optString("message", "Could not sign in")
             val elapsed = System.currentTimeMillis() - started
+            val err = classifyFailure(domain, msg, elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
             return@withContext AccountFetchOutcome(
-                classifyFailure(domain, msg, elapsed, retriesUsed),
-                newlyDiscovered,
-                congested
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf,
+                wafSignal = isWaf
             )
         }
 
@@ -391,9 +435,10 @@ class CasinoApiService {
         if (accessId.isEmpty() || accessToken.isEmpty()) {
             val elapsed = System.currentTimeMillis() - started
             return@withContext AccountFetchOutcome(
-                AccountResult.Err(domain, "other", "Sign-in did not return a session", elapsed, retriesUsed, System.currentTimeMillis()),
-                newlyDiscovered,
-                congested
+                result = AccountResult.Err(domain, "other", "Sign-in did not return a session", elapsed, retriesUsed, System.currentTimeMillis()),
+                discoveredTarget = newlyDiscovered,
+                congested = congested,
+                wafSignal = false
             )
         }
 
@@ -407,6 +452,7 @@ class CasinoApiService {
         )
 
         val syncResult = executeWithRetry(
+            maxRetries = 1,
             onRetry = { retriesUsed++ },
             onCongestion = { congested = true }
         ) {
@@ -416,17 +462,26 @@ class CasinoApiService {
         val syncJson = syncResult.getOrElse { ex ->
             val elapsed = System.currentTimeMillis() - started
             val err = classifyFailure(domain, ex.message ?: "Balances did not load", elapsed, retriesUsed)
-            return@withContext AccountFetchOutcome(err, newlyDiscovered, congested || err.code == "timeout")
+            val isWaf = isWafErrorCode(err.code)
+            return@withContext AccountFetchOutcome(
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf || err.code == "timeout",
+                wafSignal = isWaf
+            )
         }
 
         if (syncJson.optString("status") != "SUCCESS") {
             val sData = syncJson.optJSONObject("data")
             val msg = sData?.optString("message") ?: "Signed in, but balances did not load"
             val elapsed = System.currentTimeMillis() - started
+            val err = classifyFailure(domain, msg, elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
             return@withContext AccountFetchOutcome(
-                classifyFailure(domain, msg, elapsed, retriesUsed),
-                newlyDiscovered,
-                congested
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf,
+                wafSignal = isWaf
             )
         }
 
@@ -537,7 +592,7 @@ class CasinoApiService {
     }
 
     private suspend fun <T> executeWithRetry(
-        maxRetries: Int = 2,
+        maxRetries: Int = 1,
         onRetry: () -> Unit = {},
         onCongestion: () -> Unit = {},
         block: () -> T
@@ -548,27 +603,35 @@ class CasinoApiService {
                 return Result.success(block())
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: BlockedException) {
+                // Immediately signal congestion and stop — never blindly retry a firewall block
+                onCongestion()
+                return Result.failure(e)
+            } catch (e: RateLimitException) {
+                // Immediately signal congestion and stop — never hammer a 429 rate limit
+                onCongestion()
+                return Result.failure(e)
             } catch (e: TransientHttpException) {
                 onCongestion()
                 if (attempt >= maxRetries) return Result.failure(e)
                 attempt++
                 onRetry()
-                val baseMs = (500.0 * 2.0.pow((attempt - 1).toDouble())).toLong()
-                val jitterMs = Random.nextLong(80L, 340L)
+                val baseMs = (600.0 * 2.0.pow((attempt - 1).toDouble())).toLong()
+                val jitterMs = Random.nextLong(120L, 380L)
                 delay(baseMs + jitterMs)
             } catch (e: SocketTimeoutException) {
                 onCongestion()
                 if (attempt >= maxRetries) return Result.failure(IOException("timeout"))
                 attempt++
                 onRetry()
-                val baseMs = (450.0 * 2.0.pow((attempt - 1).toDouble())).toLong()
-                val jitterMs = Random.nextLong(80L, 300L)
+                val baseMs = (500.0 * 2.0.pow((attempt - 1).toDouble())).toLong()
+                val jitterMs = Random.nextLong(100L, 320L)
                 delay(baseMs + jitterMs)
             } catch (e: IOException) {
                 if (attempt >= maxRetries) return Result.failure(e)
                 attempt++
                 onRetry()
-                delay(400L + Random.nextLong(50L, 250L))
+                delay(450L + Random.nextLong(80L, 260L))
             } catch (e: Exception) {
                 return Result.failure(e)
             }
@@ -597,14 +660,23 @@ class CasinoApiService {
 
         client.newCall(reqBuilder.build()).execute().use { res ->
             val code = res.code
-            if (code == 429 || code in 500..599) {
-                throw TransientHttpException("HTTP $code")
+            if (code == 429) {
+                throw RateLimitException("Rate limited (429)")
             }
             if (code == 401 || code == 403) {
-                throw BlockedException("Page blocked ($code)")
+                throw BlockedException("Blocked by firewall ($code)")
+            }
+            if (code in 500..599) {
+                throw TransientHttpException("HTTP $code")
             }
             val str = res.body?.string()?.trim()
             if (str.isNullOrEmpty()) throw BadJsonException("empty-response")
+
+            // Detect Cloudflare / WAF HTML challenge pages returned even on 200/503 responses
+            if (isWafChallengeBody(str)) {
+                throw BlockedException("Blocked by firewall (WAF challenge)")
+            }
+
             return try {
                 JSONObject(str)
             } catch (_: Exception) {
@@ -612,6 +684,22 @@ class CasinoApiService {
             }
         }
     }
+
+    private fun isWafChallengeBody(body: String): Boolean {
+        if (!body.startsWith("<") && !body.startsWith("<!")) return false
+        val sample = body.take(2048).lowercase(Locale.US)
+        return sample.contains("just a moment") ||
+            sample.contains("cf-browser-verification") ||
+            sample.contains("challenge-platform") ||
+            sample.contains("attention required") ||
+            sample.contains("access denied") ||
+            sample.contains("cloudflare") ||
+            sample.contains("ddos-guard") ||
+            sample.contains("enable javascript and cookies")
+    }
+
+    private fun isWafErrorCode(code: String): Boolean =
+        code == "blocked" || code == "rate_limit" || code == "captcha"
 
     private fun classifyFailure(
         domain: String,
@@ -626,10 +714,11 @@ class CasinoApiService {
                 AccountResult.Err(domain, "invalid_login", "Not your account", latencyMs, retriesUsed, now)
             lower.contains("captcha") ->
                 AccountResult.Err(domain, "captcha", "Site asked for a captcha", latencyMs, retriesUsed, now)
-            lower.contains("blocked") || lower.contains("403") || lower.contains("401") ->
+            lower.contains("429") || lower.contains("rate limit") || lower.contains("too many") ->
+                AccountResult.Err(domain, "rate_limit", "Rate limited (429)", latencyMs, retriesUsed, now)
+            lower.contains("blocked") || lower.contains("waf") || lower.contains("cloudflare") ||
+                lower.contains("403") || lower.contains("401") || lower.contains("forbidden") ->
                 AccountResult.Err(domain, "blocked", "Blocked by firewall", latencyMs, retriesUsed, now)
-            lower.contains("429") ->
-                AccountResult.Err(domain, "rate_limit", "Rate limited", latencyMs, retriesUsed, now)
             lower.contains("bad-json") || lower.contains("empty-") ->
                 AccountResult.Err(domain, "unreachable", "No account JSON returned", latencyMs, retriesUsed, now)
             lower.contains("timeout") || lower.contains("timed out") ->
@@ -922,5 +1011,6 @@ class CasinoApiService {
 
     private class TransientHttpException(message: String) : IOException(message)
     private class BlockedException(message: String) : Exception(message)
+    private class RateLimitException(message: String) : Exception(message)
     private class BadJsonException(message: String) : Exception(message)
 }

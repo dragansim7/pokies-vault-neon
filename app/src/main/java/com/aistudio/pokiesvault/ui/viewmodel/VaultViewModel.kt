@@ -6,10 +6,13 @@ import androidx.lifecycle.viewModelScope
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.BonusAmountSort
 import com.aistudio.pokiesvault.data.model.BonusMode
+import com.aistudio.pokiesvault.data.model.CheckpointPauseReason
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.FallbackCred
+import com.aistudio.pokiesvault.data.model.FetchCheckpoint
 import com.aistudio.pokiesvault.data.model.FetchRunSummary
+import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusKind
 import com.aistudio.pokiesvault.data.model.PublicBonusSiteCache
@@ -40,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
@@ -78,23 +82,33 @@ data class DirectoryUiState(
     val isLoading: Boolean = true
 )
 
+data class RejectedReasonGroup(
+    val code: String,
+    val label: String,
+    val rows: List<AccountResult.Err>,
+    val isRetryable: Boolean
+)
+
 data class FetcherUiState(
     val credentials: VaultCredentials = VaultCredentials(),
+    val speedPreset: FetchSpeedPreset = FetchSpeedPreset.SAFE,
+    val activeCheckpoint: FetchCheckpoint? = null,
     val isFetching: Boolean = false,
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
     val activeWorkers: Int = 0,
     val peakWorkers: Int = 0,
-    val workerLimit: Int = 6,
+    val workerLimit: Int = 3,
     val liveStatusLabel: String = "Idle",
     val wallElapsedSec: Long = 0L,
     val signInElapsedSec: Long = 0L,
     val totalRetries: Int = 0,
     val totalAttempts: Int = 0,
-    val statusMessage: String = "Enter your phone and password to fetch wallets and bonuses concurrently.",
+    val statusMessage: String = "Enter your phone and password to fetch wallets and bonuses safely.",
     val validAccounts: List<AccountResult.Ok> = emptyList(),
     val emptyAccounts: List<AccountResult.Ok> = emptyList(),
     val rejectedAccounts: List<AccountResult.Err> = emptyList(),
+    val rejectedGroups: List<RejectedReasonGroup> = emptyList(),
     val retryableDomains: List<String> = emptyList(),
     val totalCash: Double = 0.0,
     val fetchDiffs: List<String> = emptyList(),
@@ -233,6 +247,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     private val credentialsFlow = repository.credentialsFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, VaultCredentials())
+
+    private val checkpointFlow = repository.checkpointFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     val globalState: StateFlow<VaultGlobalUiState> = combine(
         preferencesFlow,
@@ -377,7 +394,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         repository.engine.currentWorkerLimit,
         _liveStatusLabel,
         _wallElapsedSec,
-        _viewingRunId
+        _viewingRunId,
+        preferencesFlow,
+        checkpointFlow
     ) { arr ->
         val creds = arr[0] as VaultCredentials
         @Suppress("UNCHECKED_CAST")
@@ -399,13 +418,32 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val liveLabel = arr[12] as String
         val wallSec = arr[13] as Long
         val viewRunId = arr[14] as Long?
+        val prefs = arr[15] as VaultPreferences
+        val checkpoint = arr[16] as FetchCheckpoint?
 
         val okList = rows.filterIsInstance<AccountResult.Ok>()
         val valid = okList.filter { it.hasData }.sortedWith(compareByDescending<AccountResult.Ok> { it.cash }.thenBy { it.domain })
         val empty = okList.filter { !it.hasData }.sortedBy { it.domain }
         val rejected = rows.filterIsInstance<AccountResult.Err>().sortedBy { it.domain }
+
+        val knownCodes = setOf("blocked", "rate_limit", "timeout", "unreachable", "captcha", "invalid_login")
+        val byCode = rejected.groupBy { err -> if (err.code in knownCodes) err.code else "other" }
+        val groupSpecs = listOf(
+            Triple("blocked", "Blocked / Firewall", true),
+            Triple("rate_limit", "Rate Limited", true),
+            Triple("timeout", "Timed Out", true),
+            Triple("unreachable", "Unreachable", true),
+            Triple("captcha", "Captcha", false),
+            Triple("invalid_login", "Not Your Account", false),
+            Triple("other", "Other", true)
+        )
+        val rejectedGroups = groupSpecs.mapNotNull { (code, label, retryableFlag) ->
+            val groupRows = byCode[code].orEmpty()
+            if (groupRows.isEmpty()) null else RejectedReasonGroup(code, label, groupRows, retryableFlag)
+        }
+
         val retryable = rejected
-            .filter { it.code in setOf("timeout", "unreachable", "rate_limit", "other") }
+            .filter { it.code in setOf("blocked", "rate_limit", "timeout", "unreachable", "other") }
             .map { it.domain }
 
         val mine = sites.filter { it.isMine }.map { it.domain }
@@ -417,14 +455,18 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val totalRetries = rows.sumOf { it.retriesUsed }
         val totalAttempts = rows.sumOf { it.attemptsUsed }
 
+        val effectiveWorkerLimit = if (running) limitW else prefs.fetchSpeedPreset.maxWorkers
+
         FetcherUiState(
             credentials = creds,
+            speedPreset = prefs.fetchSpeedPreset,
+            activeCheckpoint = checkpoint?.takeIf { it.remainingDomains.isNotEmpty() },
             isFetching = running,
             progressDone = progress.first,
             progressTotal = progress.second,
             activeWorkers = activeW,
             peakWorkers = peakW,
-            workerLimit = limitW,
+            workerLimit = effectiveWorkerLimit,
             liveStatusLabel = liveLabel,
             wallElapsedSec = wallSec,
             signInElapsedSec = signInSec,
@@ -434,6 +476,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             validAccounts = valid,
             emptyAccounts = empty,
             rejectedAccounts = rejected,
+            rejectedGroups = rejectedGroups,
             retryableDomains = retryable,
             totalCash = valid.sumOf { it.cash },
             fetchDiffs = diffs,
@@ -630,13 +673,31 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         refreshOutgoingIp()
         viewModelScope.launch {
             repository.ensureInitialized()
-            val latestRows = repository.loadLatestRunResults()
-            if (latestRows.isNotEmpty()) {
-                _fetcherRows.value = latestRows
-                _fetcherProgress.value = latestRows.size to latestRows.size
-                _liveStatusLabel.value = "Idle"
-                val okCount = latestRows.count { it is AccountResult.Ok }
-                _fetcherStatus.value = "Loaded last saved run ($okCount of ${latestRows.size} signed in)."
+            val savedCheckpoint = repository.checkpointFlow.first()
+            if (savedCheckpoint != null && savedCheckpoint.remainingDomains.isNotEmpty()) {
+                val partialRows = savedCheckpoint.partialRunId?.let { repository.loadRunResults(it) }
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: repository.loadLatestRunResults()
+                if (partialRows.isNotEmpty()) {
+                    _fetcherRows.value = partialRows
+                }
+                _fetcherProgress.value = savedCheckpoint.completedDomains.size to savedCheckpoint.allTargetDomains.size
+                _wallElapsedSec.value = savedCheckpoint.elapsedWallSec
+                _liveStatusLabel.value = if (savedCheckpoint.pauseReason == CheckpointPauseReason.WAF_BLOCKED) {
+                    "Paused (WAF)"
+                } else {
+                    "Paused"
+                }
+                _fetcherStatus.value = "Saved checkpoint: ${savedCheckpoint.completedDomains.size} of ${savedCheckpoint.allTargetDomains.size} processed · ${savedCheckpoint.remainingDomains.size} remaining."
+            } else {
+                val latestRows = repository.loadLatestRunResults()
+                if (latestRows.isNotEmpty()) {
+                    _fetcherRows.value = latestRows
+                    _fetcherProgress.value = latestRows.size to latestRows.size
+                    _liveStatusLabel.value = "Idle"
+                    val okCount = latestRows.count { it is AccountResult.Ok }
+                    _fetcherStatus.value = "Loaded last saved run ($okCount of ${latestRows.size} signed in)."
+                }
             }
         }
     }
@@ -777,18 +838,69 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Module 2: Adaptive Parallel Account Fetcher ---
-    fun startFetch(domainsToFetch: List<String>) {
+    // --- Module 2: Paced Adaptive Account Fetcher + Checkpoints + WAF Auto-Pause ---
+    fun setFetchSpeedPreset(preset: FetchSpeedPreset) {
+        viewModelScope.launch { repository.setFetchSpeedPreset(preset) }
+    }
+
+    fun resumeCheckpoint() {
+        val cp = checkpointFlow.value
+        if (cp == null || cp.remainingDomains.isEmpty()) {
+            _snackbarEvents.tryEmit("No paused checkpoint to resume.")
+            return
+        }
+        startFetch(cp.remainingDomains, resumeCheckpoint = cp)
+    }
+
+    fun discardCheckpoint() {
+        viewModelScope.launch {
+            repository.clearCheckpoint()
+            if (!_fetcherRunning.value) {
+                _liveStatusLabel.value = "Idle"
+                _fetcherStatus.value = "Checkpoint cleared. Ready for a new fetch."
+            }
+            _snackbarEvents.tryEmit("Saved checkpoint discarded.")
+        }
+    }
+
+    fun retryRejectedCode(code: String) {
+        val group = fetcherState.value.rejectedGroups.firstOrNull { it.code == code }
+        val domains = group?.rows?.map { it.domain }.orEmpty()
+        if (domains.isEmpty()) {
+            _snackbarEvents.tryEmit("No sites in that category to retry.")
+            return
+        }
+        startFetch(domains)
+    }
+
+    fun startFetch(
+        domainsToFetch: List<String>,
+        resumeCheckpoint: FetchCheckpoint? = null
+    ) {
         val creds = credentialsFlow.value.validPairs()
         if (creds.isEmpty()) {
             _fetcherStatus.value = "Enter your phone number and password before fetching."
             return
         }
-        val uniqueDomains = domainsToFetch
-            .map { DomainUtil.normalizeDomain(it) }
-            .filter { DomainUtil.isPublicDomain(it) }
-            .distinct()
-        if (uniqueDomains.isEmpty()) {
+
+        val allTargetDomains: List<String>
+        val dispatchDomains: List<String>
+        if (resumeCheckpoint != null) {
+            allTargetDomains = resumeCheckpoint.allTargetDomains.distinct()
+            dispatchDomains = resumeCheckpoint.remainingDomains
+                .map { DomainUtil.normalizeDomain(it) }
+                .filter { DomainUtil.isPublicDomain(it) }
+                .distinct()
+        } else {
+            val normalized = domainsToFetch
+                .map { DomainUtil.normalizeDomain(it) }
+                .filter { DomainUtil.isPublicDomain(it) }
+                .distinct()
+            allTargetDomains = normalized
+            dispatchDomains = normalized
+        }
+
+        if (dispatchDomains.isEmpty()) {
             _fetcherStatus.value = "No sites selected. Bookmark accounts, enter a domain, or run a full scan."
             return
         }
@@ -796,91 +908,216 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         fetchJob?.cancel()
         wallTimerJob?.cancel()
         fetchJob = viewModelScope.launch {
-            val startedAt = System.currentTimeMillis()
+            val preset = preferencesFlow.value.fetchSpeedPreset
+            val runStartedAt = resumeCheckpoint?.runStartedAt ?: System.currentTimeMillis()
+            val segmentStartedAt = System.currentTimeMillis()
+            val baseElapsedWallSec = resumeCheckpoint?.elapsedWallSec ?: 0L
             val previousOkMap = latestAccountsFlow.value
             val hostCache = repository.loadHostCacheMap()
 
+            // Seed prior results when resuming from a checkpoint
+            val collectedMap = LinkedHashMap<String, AccountResult>(allTargetDomains.size)
+            if (resumeCheckpoint != null) {
+                val priorRows = resumeCheckpoint.partialRunId?.let { repository.loadRunResults(it) }
+                    ?.takeIf { it.isNotEmpty() }
+                    ?: _fetcherRows.value
+                val dispatchSet = dispatchDomains.toSet()
+                val targetSet = allTargetDomains.toSet()
+                for (row in priorRows) {
+                    if (row.domain in targetSet && row.domain !in dispatchSet) {
+                        collectedMap[row.domain] = row
+                    }
+                }
+            } else if (allTargetDomains.size > 1) {
+                repository.clearCheckpoint()
+            }
+
             _fetcherRunning.value = true
             _viewingRunId.value = null
-            _fetcherProgress.value = 0 to uniqueDomains.size
-            _fetcherRows.value = emptyList()
+            _fetcherProgress.value = collectedMap.size to allTargetDomains.size
+            _fetcherRows.value = collectedMap.values.toList()
             _fetcherDiffs.value = emptyList()
             _showRejected.value = false
-            _wallElapsedSec.value = 0L
-            _liveStatusLabel.value = "Running…"
-            _fetcherStatus.value = if (uniqueDomains.size == 1) {
-                "Checking ${uniqueDomains.first()}…"
-            } else {
-                "Adaptive pool checking ${uniqueDomains.size} sites…"
+            _wallElapsedSec.value = baseElapsedWallSec
+            _liveStatusLabel.value = "Running (${preset.displayName})…"
+            _fetcherStatus.value = when {
+                resumeCheckpoint != null ->
+                    "Resuming ${dispatchDomains.size} remaining sites (${preset.displayName}: ${preset.subtitle})…"
+                dispatchDomains.size == 1 ->
+                    "Checking ${dispatchDomains.first()}…"
+                else ->
+                    "${preset.displayName} mode checking ${dispatchDomains.size} sites (${preset.subtitle})…"
             }
 
             wallTimerJob = viewModelScope.launch {
                 while (isActive) {
                     delay(1000L)
-                    _wallElapsedSec.value = (System.currentTimeMillis() - startedAt) / 1000L
+                    val segSec = (System.currentTimeMillis() - segmentStartedAt) / 1000L
+                    _wallElapsedSec.value = baseElapsedWallSec + segSec
                 }
             }
 
-            val collected = ArrayList<AccountResult>(uniqueDomains.size)
             var lastUiPush = 0L
+            var sinceLastCheckpoint = 0
+            var sinceLastRoomFlush = 0
+            var latestPartialRunId: Long? = resumeCheckpoint?.partialRunId
 
             try {
-                repository.engine.fetchAccountsBatch(
-                    domains = uniqueDomains,
+                val report = repository.engine.fetchAccountsBatch(
+                    domains = dispatchDomains,
                     credentials = creds,
                     hostCache = hostCache,
+                    preset = preset,
                     onHostDiscovered = { target -> repository.saveHostTarget(target) },
                     onResult = { res ->
-                        collected.add(res)
+                        collectedMap[res.domain] = res
+                        sinceLastCheckpoint++
+                        sinceLastRoomFlush++
                         val now = System.currentTimeMillis()
-                        if (now - lastUiPush >= 120L || collected.size == uniqueDomains.size) {
+                        if (now - lastUiPush >= 120L || collectedMap.size >= allTargetDomains.size) {
                             lastUiPush = now
-                            _fetcherProgress.value = collected.size to uniqueDomains.size
-                            _fetcherRows.value = collected.toList()
+                            _fetcherProgress.value = collectedMap.size to allTargetDomains.size
+                            _fetcherRows.value = collectedMap.values.toList()
                         }
-                    }
-                )
 
-                val finalRows = collected.toList()
-                val runId = repository.persistFetchRun(startedAt, uniqueDomains.size, finalRows)
-                _viewingRunId.value = runId
-                _fetcherRows.value = finalRows
-                _fetcherProgress.value = finalRows.size to uniqueDomains.size
-
-                val diffs = buildList {
-                    for (r in finalRows) {
-                        if (r is AccountResult.Ok) {
-                            val prev = previousOkMap[r.domain]
-                            if (prev != null && abs(prev.cash - r.cash) >= 0.01) {
-                                add("${r.domain}: ${FormatUtil.money(prev.cash)} → ${FormatUtil.money(r.cash)}")
+                        // Periodic durable checkpoint during large scans (>25 sites)
+                        if (allTargetDomains.size > 25 && sinceLastCheckpoint >= 15) {
+                            sinceLastCheckpoint = 0
+                            val snapshotList = collectedMap.values.toList()
+                            if (sinceLastRoomFlush >= 60) {
+                                sinceLastRoomFlush = 0
+                                latestPartialRunId = repository.persistFetchRun(
+                                    runStartedAt,
+                                    allTargetDomains.size,
+                                    snapshotList
+                                )
+                            }
+                            val doneDomains = collectedMap.keys.toList()
+                            val remaining = allTargetDomains.filter { !collectedMap.containsKey(it) }
+                            if (remaining.isNotEmpty()) {
+                                val elapsedSec = baseElapsedWallSec + (now - segmentStartedAt) / 1000L
+                                repository.saveCheckpoint(
+                                    FetchCheckpoint(
+                                        runStartedAt = runStartedAt,
+                                        allTargetDomains = allTargetDomains,
+                                        completedDomains = doneDomains,
+                                        remainingDomains = remaining,
+                                        pauseReason = CheckpointPauseReason.INTERRUPTED,
+                                        pausedAtIp = _egressState.value.info?.ip,
+                                        pauseDetail = "In-progress checkpoint",
+                                        elapsedWallSec = elapsedSec,
+                                        partialRunId = latestPartialRunId,
+                                        savedAt = now
+                                    )
+                                )
                             }
                         }
                     }
-                }
-                _fetcherDiffs.value = diffs
-                val okCount = finalRows.count { it is AccountResult.Ok }
-                val elapsedMs = System.currentTimeMillis() - startedAt
-                val elapsedSec = elapsedMs / 1000.0
-                _wallElapsedSec.value = (elapsedMs + 500L) / 1000L
-                _liveStatusLabel.value = "Done"
-                _fetcherStatus.value = String.format(
-                    Locale.US,
-                    "Completed in %.1fs · %d of %d signed in · saved to vault.",
-                    elapsedSec,
-                    okCount,
-                    finalRows.size
                 )
-            } catch (_: CancellationException) {
-                val elapsedMs = System.currentTimeMillis() - startedAt
-                _wallElapsedSec.value = (elapsedMs + 500L) / 1000L
-                _liveStatusLabel.value = "Stopped"
-                if (collected.isNotEmpty()) {
-                    val partial = collected.toList()
-                    repository.persistFetchRun(startedAt, uniqueDomains.size, partial)
-                    _fetcherRows.value = partial
-                    _fetcherProgress.value = partial.size to uniqueDomains.size
+
+                val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
+                val totalWallSec = (totalWallMs + 500L) / 1000L
+                _wallElapsedSec.value = totalWallSec
+
+                if (report.wasCircuitBroken) {
+                    val trippedSet = report.trippedDomains.toSet()
+                    val finalPartialRows = collectedMap.values.toList()
+                    val partialRunId = if (finalPartialRows.isNotEmpty()) {
+                        repository.persistFetchRun(runStartedAt, allTargetDomains.size, finalPartialRows)
+                    } else {
+                        latestPartialRunId
+                    }
+
+                    val completedClean = collectedMap.keys.filter { it !in trippedSet }
+                    val unstarted = dispatchDomains.filter { !collectedMap.containsKey(it) }
+                    val remaining = (report.trippedDomains + unstarted).distinct()
+
+                    val checkpoint = FetchCheckpoint(
+                        runStartedAt = runStartedAt,
+                        allTargetDomains = allTargetDomains,
+                        completedDomains = completedClean,
+                        remainingDomains = remaining,
+                        pauseReason = CheckpointPauseReason.WAF_BLOCKED,
+                        pausedAtIp = _egressState.value.info?.ip,
+                        pauseDetail = report.pauseDetail.ifBlank { "Burst of firewall / rate-limit blocks detected" },
+                        elapsedWallSec = totalWallSec,
+                        partialRunId = partialRunId,
+                        savedAt = System.currentTimeMillis()
+                    )
+                    repository.saveCheckpoint(checkpoint)
+
+                    _viewingRunId.value = partialRunId
+                    _fetcherRows.value = finalPartialRows
+                    _fetcherProgress.value = completedClean.size to allTargetDomains.size
+                    _liveStatusLabel.value = "Paused (WAF)"
+                    _fetcherStatus.value = "Auto-paused to protect your IP (${report.pauseDetail}). ${remaining.size} sites queued to resume."
+                    _snackbarEvents.tryEmit("Auto-paused: rate-limit / firewall block detected. Wait or switch network before resuming.")
+                } else {
+                    val finalRows = collectedMap.values.toList()
+                    repository.clearCheckpoint()
+                    val runId = repository.persistFetchRun(runStartedAt, allTargetDomains.size, finalRows)
+                    _viewingRunId.value = runId
+                    _fetcherRows.value = finalRows
+                    _fetcherProgress.value = finalRows.size to allTargetDomains.size
+
+                    val diffs = buildList {
+                        for (r in finalRows) {
+                            if (r is AccountResult.Ok) {
+                                val prev = previousOkMap[r.domain]
+                                if (prev != null && abs(prev.cash - r.cash) >= 0.01) {
+                                    add("${r.domain}: ${FormatUtil.money(prev.cash)} → ${FormatUtil.money(r.cash)}")
+                                }
+                            }
+                        }
+                    }
+                    _fetcherDiffs.value = diffs
+                    val okCount = finalRows.count { it is AccountResult.Ok }
+                    val elapsedSec = totalWallMs / 1000.0
+                    _liveStatusLabel.value = "Done"
+                    _fetcherStatus.value = String.format(
+                        Locale.US,
+                        "Completed in %.1fs · %d of %d signed in · saved to vault.",
+                        elapsedSec,
+                        okCount,
+                        finalRows.size
+                    )
                 }
-                _fetcherStatus.value = "Stopped. ${collected.count { it is AccountResult.Ok }} completed hits were saved."
+            } catch (_: CancellationException) {
+                val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
+                val totalWallSec = (totalWallMs + 500L) / 1000L
+                _wallElapsedSec.value = totalWallSec
+                val partial = collectedMap.values.toList()
+                val partialRunId = if (partial.isNotEmpty()) {
+                    repository.persistFetchRun(runStartedAt, allTargetDomains.size, partial)
+                } else {
+                    latestPartialRunId
+                }
+                if (partial.isNotEmpty()) {
+                    _fetcherRows.value = partial
+                    _fetcherProgress.value = partial.size to allTargetDomains.size
+                }
+                val remaining = allTargetDomains.filter { !collectedMap.containsKey(it) }
+                if (remaining.isNotEmpty() && allTargetDomains.size > 1) {
+                    repository.saveCheckpoint(
+                        FetchCheckpoint(
+                            runStartedAt = runStartedAt,
+                            allTargetDomains = allTargetDomains,
+                            completedDomains = collectedMap.keys.toList(),
+                            remainingDomains = remaining,
+                            pauseReason = CheckpointPauseReason.USER_STOPPED,
+                            pausedAtIp = _egressState.value.info?.ip,
+                            pauseDetail = "Paused by you",
+                            elapsedWallSec = totalWallSec,
+                            partialRunId = partialRunId,
+                            savedAt = System.currentTimeMillis()
+                        )
+                    )
+                    _liveStatusLabel.value = "Paused"
+                    _fetcherStatus.value = "Paused. ${partial.size} of ${allTargetDomains.size} saved · ${remaining.size} remaining."
+                } else {
+                    _liveStatusLabel.value = "Stopped"
+                    _fetcherStatus.value = "Stopped. ${partial.count { it is AccountResult.Ok }} completed hits were saved."
+                }
             } finally {
                 wallTimerJob?.cancel()
                 wallTimerJob = null
@@ -892,7 +1129,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun retryFailedFetches() {
         val retryTargets = fetcherState.value.retryableDomains
         if (retryTargets.isEmpty()) {
-            _snackbarEvents.tryEmit("No retryable network failures in this run.")
+            _snackbarEvents.tryEmit("No recoverable failures in this run.")
             return
         }
         startFetch(retryTargets)
