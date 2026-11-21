@@ -3,6 +3,7 @@ package com.aistudio.pokiesvault.data.network
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.BonusView
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
+import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusKind
 import com.aistudio.pokiesvault.data.model.PublicBonusSlot
@@ -87,6 +88,105 @@ class CasinoApiService {
     private val shareRegex = Regex("share|refer|invite|downline")
     private val dailyRegex = Regex("\\bdaily\\b|every day")
     private val signupRegex = Regex("sign\\s?up|register|no deposit|welcome|new register|free credit")
+
+    /**
+     * Resolves the device's current public outbound IP, ISP, and location using ipwho.is,
+     * with automatic fallback to ipapi.co and api.ipify.org for high availability.
+     */
+    suspend fun lookupEgressInfo(): Result<EgressIpInfo> = withContext(Dispatchers.IO) {
+        val now = System.currentTimeMillis()
+        // Primary: ipwho.is
+        try {
+            val req = Request.Builder()
+                .url("https://ipwho.is/")
+                .header("Accept", "application/json")
+                .header("User-Agent", userAgent)
+                .get()
+                .build()
+            probeClient.newCall(req).execute().use { res ->
+                if (res.isSuccessful) {
+                    val body = res.body?.string()
+                    if (!body.isNullOrBlank()) {
+                        val obj = JSONObject(body)
+                        val ip = obj.optString("ip", "").trim()
+                        if (obj.optBoolean("success", true) && ip.isNotEmpty()) {
+                            val conn = obj.optJSONObject("connection")
+                            val isp = conn?.optString("isp", "")?.takeIf { it.isNotBlank() }
+                                ?: conn?.optString("org", "")?.takeIf { it.isNotBlank() }
+                                ?: "Unknown network"
+                            val city = obj.optString("city", "").trim()
+                            val cc = obj.optString("country_code", "").trim()
+                            val loc = listOf(city, cc).filter { it.isNotBlank() }.joinToString(", ")
+                            return@withContext Result.success(EgressIpInfo(ip, isp, loc, now))
+                        }
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Fall through to secondary provider
+        }
+
+        // Secondary: ipapi.co
+        try {
+            val req = Request.Builder()
+                .url("https://ipapi.co/json/")
+                .header("Accept", "application/json")
+                .header("User-Agent", userAgent)
+                .get()
+                .build()
+            probeClient.newCall(req).execute().use { res ->
+                if (res.isSuccessful) {
+                    val body = res.body?.string()
+                    if (!body.isNullOrBlank()) {
+                        val obj = JSONObject(body)
+                        val ip = obj.optString("ip", "").trim()
+                        if (ip.isNotEmpty()) {
+                            val isp = obj.optString("org", "").ifBlank { "Unknown network" }
+                            val city = obj.optString("city", "").trim()
+                            val cc = obj.optString("country_code", "").trim()
+                            val loc = listOf(city, cc).filter { it.isNotBlank() }.joinToString(", ")
+                            return@withContext Result.success(EgressIpInfo(ip, isp, loc, now))
+                        }
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // Fall through to tertiary IP-only provider
+        }
+
+        // Tertiary: api.ipify.org
+        try {
+            val req = Request.Builder()
+                .url("https://api.ipify.org?format=json")
+                .header("Accept", "application/json")
+                .header("User-Agent", userAgent)
+                .get()
+                .build()
+            probeClient.newCall(req).execute().use { res ->
+                if (res.isSuccessful) {
+                    val body = res.body?.string()
+                    if (!body.isNullOrBlank()) {
+                        val ip = JSONObject(body).optString("ip", "").trim()
+                        if (ip.isNotEmpty()) {
+                            return@withContext Result.success(
+                                EgressIpInfo(ip, "Local network", "", now)
+                            )
+                        }
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return@withContext Result.failure(e)
+        }
+
+        Result.failure(IOException("Could not determine outgoing IP"))
+    }
 
     suspend fun checkSiteStatus(rawDomain: String): DomainHealthRecord = withContext(Dispatchers.IO) {
         val domain = DomainUtil.normalizeDomain(rawDomain)

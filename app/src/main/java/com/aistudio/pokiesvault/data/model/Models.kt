@@ -111,10 +111,19 @@ data class WalletView(
 )
 
 @Serializable
+data class EgressIpInfo(
+    val ip: String,
+    val isp: String,
+    val location: String,
+    val fetchedAt: Long = 0L
+)
+
+@Serializable
 sealed class AccountResult {
     abstract val domain: String
     abstract val latencyMs: Long
     abstract val retriesUsed: Int
+    abstract val attemptsUsed: Int
     abstract val fetchedAt: Long
 
     @Serializable
@@ -134,7 +143,8 @@ sealed class AccountResult {
         val availableBonuses: List<BonusView>,
         override val latencyMs: Long = 0L,
         override val retriesUsed: Int = 0,
-        override val fetchedAt: Long = 0L
+        override val fetchedAt: Long = 0L,
+        override val attemptsUsed: Int = 1
     ) : AccountResult()
 
     @Serializable
@@ -144,7 +154,8 @@ sealed class AccountResult {
         val message: String,
         override val latencyMs: Long = 0L,
         override val retriesUsed: Int = 0,
-        override val fetchedAt: Long = 0L
+        override val fetchedAt: Long = 0L,
+        override val attemptsUsed: Int = 1
     ) : AccountResult()
 }
 

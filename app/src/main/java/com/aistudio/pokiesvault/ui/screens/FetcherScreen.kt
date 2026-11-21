@@ -57,6 +57,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aistudio.pokiesvault.R
 import com.aistudio.pokiesvault.ui.components.AccountResultCard
 import com.aistudio.pokiesvault.ui.components.EmptyStateCard
+import com.aistudio.pokiesvault.ui.components.LiveFetchStatsCard
+import com.aistudio.pokiesvault.ui.components.OutgoingIpCard
 import com.aistudio.pokiesvault.ui.components.ResponsibleGamblingFooter
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
@@ -70,6 +72,7 @@ fun FetcherScreen(
     modifier: Modifier = Modifier
 ) {
     val state by viewModel.fetcherState.collectAsStateWithLifecycle()
+    val egressState by viewModel.egressState.collectAsStateWithLifecycle()
     val palette = LocalVaultPalette.current
 
     var showPassword by remember { mutableStateOf(false) }
@@ -125,6 +128,21 @@ fun FetcherScreen(
                         Text("History (${state.fetchRuns.size})", color = palette.accentA)
                     }
                 }
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
+            // Outgoing Device IP Panel
+            item(key = "fetcher_outgoing_ip") {
+                OutgoingIpCard(
+                    egressState = egressState,
+                    onRefresh = { viewModel.refreshOutgoingIp() }
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
+            // Live Fetch Telemetry Panel
+            item(key = "fetcher_live_stats") {
+                LiveFetchStatsCard(state = state)
                 Spacer(modifier = Modifier.height(12.dp))
             }
 

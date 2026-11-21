@@ -7,6 +7,7 @@ import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.BonusAmountSort
 import com.aistudio.pokiesvault.data.model.BonusMode
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
+import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.FallbackCred
 import com.aistudio.pokiesvault.data.model.FetchRunSummary
 import com.aistudio.pokiesvault.data.model.PublicBonus
@@ -28,6 +29,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -41,11 +43,18 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.Locale
 import kotlin.math.abs
+
+data class EgressUiState(
+    val isLoading: Boolean = true,
+    val info: EgressIpInfo? = null,
+    val error: String? = null
+)
 
 data class DirectorySiteItem(
     val site: SiteRecord,
@@ -75,7 +84,13 @@ data class FetcherUiState(
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
     val activeWorkers: Int = 0,
+    val peakWorkers: Int = 0,
     val workerLimit: Int = 6,
+    val liveStatusLabel: String = "Idle",
+    val wallElapsedSec: Long = 0L,
+    val signInElapsedSec: Long = 0L,
+    val totalRetries: Int = 0,
+    val totalAttempts: Int = 0,
     val statusMessage: String = "Enter your phone and password to fetch wallets and bonuses concurrently.",
     val validAccounts: List<AccountResult.Ok> = emptyList(),
     val emptyAccounts: List<AccountResult.Ok> = emptyList(),
@@ -171,11 +186,16 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val _intelSelectedDomains = MutableStateFlow<Set<String>>(emptySet())
 
     // --- Ephemeral Checking/Scanning State ---
+    private val _egressState = MutableStateFlow(EgressUiState())
+    val egressState: StateFlow<EgressUiState> = _egressState.asStateFlow()
+
     private val _checkingDomains = MutableStateFlow<Set<String>>(emptySet())
     private val _fetcherRows = MutableStateFlow<List<AccountResult>>(emptyList())
     private val _fetcherRunning = MutableStateFlow(false)
     private val _fetcherProgress = MutableStateFlow(0 to 0)
     private val _fetcherStatus = MutableStateFlow("Enter your phone and password to fetch wallets and bonuses concurrently.")
+    private val _liveStatusLabel = MutableStateFlow("Idle")
+    private val _wallElapsedSec = MutableStateFlow(0L)
     private val _fetcherDiffs = MutableStateFlow<List<String>>(emptyList())
     private val _showRejected = MutableStateFlow(false)
     private val _viewingRunId = MutableStateFlow<Long?>(null)
@@ -189,6 +209,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val _intelStatus = MutableStateFlow("Unified list shared across Directory, Fetcher, and Bonus Finder.")
 
     private var fetchJob: Job? = null
+    private var wallTimerJob: Job? = null
+    private var egressJob: Job? = null
     private var bonusScanJob: Job? = null
     private var intelCheckJob: Job? = null
     private var credSaveJob: Job? = null
@@ -351,7 +373,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         _showRejected,
         repository.fetchRunsFlow,
         repository.engine.activeWorkers,
+        repository.engine.peakWorkers,
         repository.engine.currentWorkerLimit,
+        _liveStatusLabel,
+        _wallElapsedSec,
         _viewingRunId
     ) { arr ->
         val creds = arr[0] as VaultCredentials
@@ -369,8 +394,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         @Suppress("UNCHECKED_CAST")
         val runs = arr[8] as List<FetchRunSummary>
         val activeW = arr[9] as Int
-        val limitW = arr[10] as Int
-        val viewRunId = arr[11] as Long?
+        val peakW = arr[10] as Int
+        val limitW = arr[11] as Int
+        val liveLabel = arr[12] as String
+        val wallSec = arr[13] as Long
+        val viewRunId = arr[14] as Long?
 
         val okList = rows.filterIsInstance<AccountResult.Ok>()
         val valid = okList.filter { it.hasData }.sortedWith(compareByDescending<AccountResult.Ok> { it.cash }.thenBy { it.domain })
@@ -384,13 +412,24 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val visited = sites.filter { it.isVisited }.map { it.domain }
         val mineTargets = mine.ifEmpty { visited }
 
+        val totalLatencyMs = rows.sumOf { it.latencyMs }
+        val signInSec = (totalLatencyMs + 500L) / 1000L
+        val totalRetries = rows.sumOf { it.retriesUsed }
+        val totalAttempts = rows.sumOf { it.attemptsUsed }
+
         FetcherUiState(
             credentials = creds,
             isFetching = running,
             progressDone = progress.first,
             progressTotal = progress.second,
             activeWorkers = activeW,
+            peakWorkers = peakW,
             workerLimit = limitW,
+            liveStatusLabel = liveLabel,
+            wallElapsedSec = wallSec,
+            signInElapsedSec = signInSec,
+            totalRetries = totalRetries,
+            totalAttempts = totalAttempts,
             statusMessage = statusMsg,
             validAccounts = valid,
             emptyAccounts = empty,
@@ -588,13 +627,34 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     val intelSearchInput: StateFlow<String> = _intelSearch.asStateFlow()
 
     init {
+        refreshOutgoingIp()
         viewModelScope.launch {
             repository.ensureInitialized()
             val latestRows = repository.loadLatestRunResults()
             if (latestRows.isNotEmpty()) {
                 _fetcherRows.value = latestRows
+                _fetcherProgress.value = latestRows.size to latestRows.size
+                _liveStatusLabel.value = "Idle"
                 val okCount = latestRows.count { it is AccountResult.Ok }
                 _fetcherStatus.value = "Loaded last saved run ($okCount of ${latestRows.size} signed in)."
+            }
+        }
+    }
+
+    fun refreshOutgoingIp() {
+        egressJob?.cancel()
+        egressJob = viewModelScope.launch {
+            _egressState.update { it.copy(isLoading = true, error = null) }
+            val result = repository.engine.lookupEgressInfo()
+            result.onSuccess { info ->
+                _egressState.value = EgressUiState(isLoading = false, info = info, error = null)
+            }.onFailure { err ->
+                _egressState.update { prev ->
+                    prev.copy(
+                        isLoading = false,
+                        error = err.message ?: "Unable to detect outgoing IP"
+                    )
+                }
             }
         }
     }
@@ -734,6 +794,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         fetchJob?.cancel()
+        wallTimerJob?.cancel()
         fetchJob = viewModelScope.launch {
             val startedAt = System.currentTimeMillis()
             val previousOkMap = latestAccountsFlow.value
@@ -745,10 +806,19 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             _fetcherRows.value = emptyList()
             _fetcherDiffs.value = emptyList()
             _showRejected.value = false
+            _wallElapsedSec.value = 0L
+            _liveStatusLabel.value = "Running…"
             _fetcherStatus.value = if (uniqueDomains.size == 1) {
                 "Checking ${uniqueDomains.first()}…"
             } else {
                 "Adaptive pool checking ${uniqueDomains.size} sites…"
+            }
+
+            wallTimerJob = viewModelScope.launch {
+                while (isActive) {
+                    delay(1000L)
+                    _wallElapsedSec.value = (System.currentTimeMillis() - startedAt) / 1000L
+                }
             }
 
             val collected = ArrayList<AccountResult>(uniqueDomains.size)
@@ -789,7 +859,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 _fetcherDiffs.value = diffs
                 val okCount = finalRows.count { it is AccountResult.Ok }
-                val elapsedSec = ((System.currentTimeMillis() - startedAt) / 1000.0)
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                val elapsedSec = elapsedMs / 1000.0
+                _wallElapsedSec.value = (elapsedMs + 500L) / 1000L
+                _liveStatusLabel.value = "Done"
                 _fetcherStatus.value = String.format(
                     Locale.US,
                     "Completed in %.1fs · %d of %d signed in · saved to vault.",
@@ -798,13 +871,19 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                     finalRows.size
                 )
             } catch (_: CancellationException) {
+                val elapsedMs = System.currentTimeMillis() - startedAt
+                _wallElapsedSec.value = (elapsedMs + 500L) / 1000L
+                _liveStatusLabel.value = "Stopped"
                 if (collected.isNotEmpty()) {
                     val partial = collected.toList()
                     repository.persistFetchRun(startedAt, uniqueDomains.size, partial)
                     _fetcherRows.value = partial
+                    _fetcherProgress.value = partial.size to uniqueDomains.size
                 }
                 _fetcherStatus.value = "Stopped. ${collected.count { it is AccountResult.Ok }} completed hits were saved."
             } finally {
+                wallTimerJob?.cancel()
+                wallTimerJob = null
                 _fetcherRunning.value = false
             }
         }
@@ -830,7 +909,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun loadHistoricalRun(runId: Long) {
         viewModelScope.launch {
             val rows = repository.loadRunResults(runId)
+            val runSummary = fetcherState.value.fetchRuns.firstOrNull { it.runId == runId }
             _fetcherRows.value = rows
+            _fetcherProgress.value = rows.size to (runSummary?.targetCount ?: rows.size)
+            _wallElapsedSec.value = if (runSummary != null && runSummary.completedAt > runSummary.startedAt) {
+                (runSummary.completedAt - runSummary.startedAt + 500L) / 1000L
+            } else {
+                0L
+            }
+            _liveStatusLabel.value = "Saved run"
             _viewingRunId.value = runId
             _fetcherDiffs.value = emptyList()
             _fetcherStatus.value = "Viewing saved run (${rows.count { it is AccountResult.Ok }} of ${rows.size} signed in)."
@@ -1028,11 +1115,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearAllDeviceData() {
         fetchJob?.cancel()
+        wallTimerJob?.cancel()
         bonusScanJob?.cancel()
         intelCheckJob?.cancel()
         viewModelScope.launch {
             repository.clearAllDeviceData()
             _fetcherRows.value = emptyList()
+            _fetcherProgress.value = 0 to 0
+            _wallElapsedSec.value = 0L
+            _liveStatusLabel.value = "Idle"
             _fetcherDiffs.value = emptyList()
             _intelSelectedDomains.value = emptySet()
             _snackbarEvents.tryEmit("Cleared all local vault data.")

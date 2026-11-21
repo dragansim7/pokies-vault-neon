@@ -3,8 +3,8 @@ package com.aistudio.pokiesvault.data.network
 import com.aistudio.pokiesvault.data.local.HostCacheEntity
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
+import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -28,10 +28,13 @@ class ConcurrentFetchEngine(
 
     val currentWorkerLimit: StateFlow<Int> = adaptiveController.currentLimit
     val activeWorkers: StateFlow<Int> = adaptiveController.activeWorkers
+    val peakWorkers: StateFlow<Int> = adaptiveController.peakWorkers
+
+    suspend fun lookupEgressInfo(): Result<EgressIpInfo> = apiService.lookupEgressInfo()
 
     /**
      * Fetches multiple casino accounts concurrently using the adaptive 6-8 worker pool.
-     * Emits each completed result to [onResult] without letting any single failure abort the batch.
+     * Tracks total retries and attempts across fallback credential rotations per domain.
      */
     suspend fun fetchAccountsBatch(
         domains: List<String>,
@@ -61,6 +64,9 @@ class ConcurrentFetchEngine(
                             fetchedAt = System.currentTimeMillis()
                         )
                         var sawCongestion = false
+                        var totalAttempts = 0
+                        var totalRetries = 0
+                        var totalLatencyMs = 0L
 
                         for ((phone, password) in credentials) {
                             val outcome = apiService.fetchCasinoAccount(
@@ -75,13 +81,25 @@ class ConcurrentFetchEngine(
                             }
                             if (outcome.congested) sawCongestion = true
 
+                            totalRetries += outcome.result.retriesUsed
+                            totalAttempts += (1 + outcome.result.retriesUsed)
+                            totalLatencyMs += outcome.result.latencyMs
+
                             when (val res = outcome.result) {
                                 is AccountResult.Ok -> {
-                                    finalResult = res
+                                    finalResult = res.copy(
+                                        latencyMs = totalLatencyMs,
+                                        retriesUsed = totalRetries,
+                                        attemptsUsed = totalAttempts
+                                    )
                                     break
                                 }
                                 is AccountResult.Err -> {
-                                    finalResult = res
+                                    finalResult = res.copy(
+                                        latencyMs = totalLatencyMs,
+                                        retriesUsed = totalRetries,
+                                        attemptsUsed = totalAttempts
+                                    )
                                     // Rotate to fallback credential only on invalid_login
                                     if (res.code != "invalid_login") break
                                 }

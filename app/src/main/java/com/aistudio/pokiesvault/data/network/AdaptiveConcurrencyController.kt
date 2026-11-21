@@ -1,14 +1,14 @@
 package com.aistudio.pokiesvault.data.network
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.delay
 
 /**
- * Adaptive coroutine concurrency limiter (AIMD-style).
+ * Adaptive coroutine concurrency limiter (AIMD-style) with live active and peak worker telemetry.
  * Starts at [initialLimit] (6), scales up to [maxLimit] (8) on sustained healthy responses,
  * and scales down toward [minLimit] (3) when rate-limit (429) or timeout bursts occur.
  */
@@ -19,6 +19,7 @@ class AdaptiveConcurrencyController(
 ) {
     private val mutex = Mutex()
     private var inFlight: Int = 0
+    private var peakObserved: Int = 0
     private var targetLimit: Int = initialLimit.coerceIn(minLimit, maxLimit)
     private var consecutiveHealthy: Int = 0
 
@@ -27,6 +28,9 @@ class AdaptiveConcurrencyController(
 
     private val _activeWorkers = MutableStateFlow(0)
     val activeWorkers: StateFlow<Int> = _activeWorkers.asStateFlow()
+
+    private val _peakWorkers = MutableStateFlow(0)
+    val peakWorkers: StateFlow<Int> = _peakWorkers.asStateFlow()
 
     suspend fun <T> withPermit(block: suspend () -> T): T {
         acquire()
@@ -42,6 +46,10 @@ class AdaptiveConcurrencyController(
             val granted = mutex.withLock {
                 if (inFlight < targetLimit) {
                     inFlight++
+                    if (inFlight > peakObserved) {
+                        peakObserved = inFlight
+                        _peakWorkers.value = peakObserved
+                    }
                     _activeWorkers.value = inFlight
                     true
                 } else {
@@ -85,6 +93,8 @@ class AdaptiveConcurrencyController(
         mutex.withLock {
             targetLimit = limit.coerceIn(minLimit, maxLimit)
             consecutiveHealthy = 0
+            peakObserved = 0
+            _peakWorkers.value = 0
             _currentLimit.value = targetLimit
         }
     }
