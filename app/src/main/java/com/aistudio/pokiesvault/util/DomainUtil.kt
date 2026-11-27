@@ -37,6 +37,22 @@ object DomainUtil {
         return true
     }
 
+    private val searchStripRegex = Regex("[^a-z0-9]")
+    private val searchSplitRegex = Regex("[^a-z0-9]+")
+
+    fun matchesSearch(domain: String, query: String): Boolean {
+        val raw = query.trim().lowercase(Locale.US)
+        if (raw.isEmpty()) return true
+        val cleaned = raw.replace(schemeRegex, "").removePrefix("www.")
+        val normQuery = cleaned.substringBefore("/").substringBefore("?").substringBefore("#")
+            .replace(searchStripRegex, "")
+        if (normQuery.isEmpty()) return true
+        val normDomain = domain.lowercase(Locale.US).replace(searchStripRegex, "")
+        if (normDomain.contains(normQuery)) return true
+        val tokens = cleaned.split(searchSplitRegex).filter { it.isNotEmpty() }
+        return tokens.isEmpty() || tokens.all { normDomain.contains(it) }
+    }
+
     fun extractDomainsFromText(rawText: String): List<String> {
         if (rawText.isBlank()) return emptyList()
         val seen = LinkedHashSet<String>()
@@ -75,6 +91,38 @@ object FormatUtil {
             String.format(Locale.US, "$%,d", roundedCents / 100L)
         } else {
             String.format(Locale.US, "$%,.2f", rounded)
+        }
+    }
+
+    fun parseIsoEpochMs(isoString: String?): Long {
+        if (isoString.isNullOrBlank()) return 0L
+        if (isoString.equals("Now", ignoreCase = true)) return System.currentTimeMillis()
+        return try {
+            OffsetDateTime.parse(isoString).toInstant().toEpochMilli()
+        } catch (_: Exception) {
+            try {
+                Instant.parse(isoString).toEpochMilli()
+            } catch (_: Exception) {
+                0L
+            }
+        }
+    }
+
+    fun timeAgo(isoString: String?): String {
+        if (isoString.isNullOrBlank()) return ""
+        if (isoString.equals("Now", ignoreCase = true)) return "Just now"
+        val ts = parseIsoEpochMs(isoString)
+        if (ts <= 0L) return ""
+        val diffSec = ((System.currentTimeMillis() - ts) / 1000L).coerceAtLeast(0L)
+        val mins = diffSec / 60L
+        val hours = mins / 60L
+        val days = hours / 24L
+        return when {
+            mins < 1L -> "Just now"
+            mins < 60L -> "${mins}m ago"
+            hours < 24L -> "${hours}h ago"
+            days < 60L -> "${days}d ago"
+            else -> "${days / 30L}mo ago"
         }
     }
 

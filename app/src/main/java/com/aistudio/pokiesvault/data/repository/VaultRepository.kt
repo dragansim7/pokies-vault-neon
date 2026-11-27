@@ -12,6 +12,7 @@ import com.aistudio.pokiesvault.data.local.VaultDatabase
 import com.aistudio.pokiesvault.data.local.VaultPreferencesStore
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.BonusMode
+import com.aistudio.pokiesvault.data.model.CardColor
 import com.aistudio.pokiesvault.data.model.CatalogSite
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.FallbackCred
@@ -20,6 +21,7 @@ import com.aistudio.pokiesvault.data.model.FetchRunSummary
 import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusSiteCache
+import com.aistudio.pokiesvault.data.model.SavedDomainSession
 import com.aistudio.pokiesvault.data.model.SiteGroup
 import com.aistudio.pokiesvault.data.model.SiteRecord
 import com.aistudio.pokiesvault.data.model.SiteStatus
@@ -29,6 +31,7 @@ import com.aistudio.pokiesvault.data.model.VaultCredentials
 import com.aistudio.pokiesvault.data.model.VaultPreferences
 import com.aistudio.pokiesvault.data.model.VaultThemeId
 import com.aistudio.pokiesvault.data.model.ViewMode
+import com.aistudio.pokiesvault.data.network.AccountFetchOutcome
 import com.aistudio.pokiesvault.data.network.CasinoApiService
 import com.aistudio.pokiesvault.data.network.ConcurrentFetchEngine
 import com.aistudio.pokiesvault.data.network.ConcurrentFetchEngine.Companion.toHostTarget
@@ -55,12 +58,20 @@ class VaultRepository(private val context: Context) {
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
+        prettyPrint = false
+    }
+
+    private val prettyJson = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
         prettyPrint = true
     }
 
     val preferencesFlow: Flow<VaultPreferences> = prefsStore.preferencesFlow
     val credentialsFlow: Flow<VaultCredentials> = prefsStore.credentialsFlow
     val checkpointFlow: Flow<FetchCheckpoint?> = prefsStore.checkpointFlow
+    val bonusCheckpointFlow: Flow<FetchCheckpoint?> = prefsStore.bonusCheckpointFlow
+    val domainSessionsFlow: Flow<Map<String, SavedDomainSession>> = prefsStore.domainSessionsFlow
     val hiddenCountFlow: Flow<Int> = dao.observeHiddenCount()
 
     val visibleSitesFlow: Flow<List<SiteRecord>> = dao.observeVisibleSites().map { entities ->
@@ -108,6 +119,48 @@ class VaultRepository(private val context: Context) {
                 }
             }
             out
+        }
+
+    val latestResultsByDomainFlow: Flow<Map<String, AccountResult>> =
+        dao.observeLatestSnapshots().map { snapshots ->
+            val out = HashMap<String, AccountResult>(snapshots.size)
+            for (snap in snapshots) {
+                val decoded = decodeAccountResult(snap.payloadJson)
+                if (decoded != null) {
+                    val existing = out[snap.domain]
+                    // Prefer OK over Err if two snapshots share the exact same millisecond timestamp
+                    if (existing == null || (existing is AccountResult.Err && decoded is AccountResult.Ok)) {
+                        out[snap.domain] = decoded
+                    }
+                }
+            }
+            out
+        }
+
+    val sameCasinoCountsFlow: Flow<Map<String, Int>> =
+        dao.observeHostCaches().map { caches ->
+            val byCluster = HashMap<String, MutableSet<String>>()
+            val domainToCluster = HashMap<String, String>(caches.size)
+            for (entry in caches) {
+                val domain = DomainUtil.normalizeDomain(entry.domain)
+                if (domain.isBlank()) continue
+                val key = when {
+                    entry.merchantId.isNotBlank() -> "mid:${entry.merchantId.trim()}"
+                    entry.resolvedHost.isNotBlank() && DomainUtil.normalizeDomain(entry.resolvedHost) != domain ->
+                        "host:${DomainUtil.normalizeDomain(entry.resolvedHost)}"
+                    else -> continue
+                }
+                domainToCluster[domain] = key
+                byCluster.getOrPut(key) { LinkedHashSet() }.add(domain)
+            }
+            val counts = HashMap<String, Int>(domainToCluster.size)
+            for ((domain, key) in domainToCluster) {
+                val clusterSize = byCluster[key]?.size ?: 1
+                if (clusterSize > 1) {
+                    counts[domain] = clusterSize - 1
+                }
+            }
+            counts
         }
 
     val fetchRunsFlow: Flow<List<FetchRunSummary>> = dao.observeFetchRuns().map { runs ->
@@ -194,7 +247,7 @@ class VaultRepository(private val context: Context) {
             }
 
             if (legacyMine.isNotEmpty()) {
-                dao.markAllMine(legacyMine.map { DomainUtil.normalizeDomain(it) })
+                dao.markAllMineChunked(legacyMine.map { DomainUtil.normalizeDomain(it) })
             }
             for (v in legacyVisited) {
                 dao.updateVisited(DomainUtil.normalizeDomain(v), true)
@@ -224,6 +277,33 @@ class VaultRepository(private val context: Context) {
                 .putBoolean("migrated_to_room_v2", true)
                 .apply()
         }
+
+        cleanupDuplicateSnapshotsIfNeeded()
+    }
+
+    /**
+     * Removes redundant duplicate partial-scan snapshot rows from earlier large runs while
+     * strictly preserving the latest saved snapshot and latest OK balance per site.
+     */
+    suspend fun cleanupDuplicateSnapshotsIfNeeded(): Int = withContext(Dispatchers.IO) {
+        try {
+            val totalRows = dao.countSnapshots()
+            if (totalRows <= 50) return@withContext 0
+            val distinctDomains = dao.countDistinctSnapshotDomains().coerceAtLeast(1)
+            // Only compact when duplicates exist beyond the 2 retained rows per domain (latest + latest OK)
+            if (totalRows > distinctDomains * 2) {
+                val checkpointRunId = try {
+                    prefsStore.checkpointFlow.first()?.partialRunId
+                } catch (_: Exception) {
+                    null
+                }
+                dao.cleanupDuplicateSnapshots(preserveRunId = checkpointRunId)
+            } else {
+                0
+            }
+        } catch (_: Throwable) {
+            0
+        }
     }
 
     // --- Preferences & Credentials ---
@@ -231,13 +311,77 @@ class VaultRepository(private val context: Context) {
     suspend fun setViewMode(mode: ViewMode) = prefsStore.setViewMode(mode)
     suspend fun setSortMode(mode: SortMode) = prefsStore.setSortMode(mode)
     suspend fun setBonusMode(mode: BonusMode) = prefsStore.setBonusMode(mode)
+    suspend fun setCardColor(color: CardColor) = prefsStore.setCardColor(color)
     suspend fun setNotVisited(enabled: Boolean) = prefsStore.setNotVisited(enabled)
+    suspend fun setSignupOnly(enabled: Boolean) = prefsStore.setSignupOnly(enabled)
     suspend fun setWallets(enabled: Boolean) = prefsStore.setWallets(enabled)
     suspend fun setMineOnly(enabled: Boolean) = prefsStore.setMineOnly(enabled)
+    suspend fun applySortFilter(
+        sortMode: SortMode,
+        bonusMode: BonusMode,
+        notVisited: Boolean,
+        signupOnly: Boolean,
+        mineOnly: Boolean
+    ) = prefsStore.applySortFilter(sortMode, bonusMode, notVisited, signupOnly, mineOnly)
+    suspend fun resetSortFilter() = prefsStore.resetSortFilter()
     suspend fun setFetchSpeedPreset(preset: FetchSpeedPreset) = prefsStore.setFetchSpeedPreset(preset)
+    suspend fun setBonusSpeedPreset(preset: FetchSpeedPreset) = prefsStore.setBonusSpeedPreset(preset)
+    suspend fun setAllowBackgroundRuns(enabled: Boolean) = prefsStore.setAllowBackgroundRuns(enabled)
     suspend fun saveCheckpoint(checkpoint: FetchCheckpoint) = prefsStore.saveCheckpoint(checkpoint)
     suspend fun clearCheckpoint() = prefsStore.clearCheckpoint()
+    suspend fun saveBonusCheckpoint(checkpoint: FetchCheckpoint) = prefsStore.saveBonusCheckpoint(checkpoint)
+    suspend fun clearBonusCheckpoint() = prefsStore.clearBonusCheckpoint()
     suspend fun saveCredentials(credentials: VaultCredentials) = prefsStore.saveCredentials(credentials)
+    suspend fun loadDomainSessionsMap(): Map<String, SavedDomainSession> = prefsStore.domainSessionsFlow.first()
+    suspend fun saveDomainSession(session: SavedDomainSession) = prefsStore.saveDomainSession(session)
+    suspend fun saveDomainSessionsBatch(updates: Map<String, SavedDomainSession>) =
+        prefsStore.saveDomainSessionsBatch(updates)
+    suspend fun clearDomainToken(domain: String) = prefsStore.clearDomainToken(domain)
+
+    suspend fun syncWithCapturedSession(
+        rawDomain: String,
+        accessId: String,
+        accessToken: String,
+        host: String = "",
+        merchantId: String = ""
+    ): AccountFetchOutcome {
+        val domain = DomainUtil.normalizeDomain(rawDomain)
+        val cachedMap = loadHostCacheMap()
+        val existingTarget = cachedMap[domain]
+        val effectiveHost = host.takeIf { DomainUtil.isPublicDomain(it) }
+            ?: existingTarget?.host?.takeIf { DomainUtil.isPublicDomain(it) }
+            ?: domain
+        val effectiveMerchant = merchantId.ifBlank { existingTarget?.merchantId.orEmpty() }
+        val target = if (effectiveMerchant.isNotBlank() || effectiveHost != domain) {
+            HostTarget(domain = domain, host = effectiveHost, merchantId = effectiveMerchant)
+        } else {
+            existingTarget
+        }
+        val outcome = apiService.syncAccountWithSession(
+            rawDomain = domain,
+            accessId = accessId,
+            accessToken = accessToken,
+            cachedTarget = target
+        )
+        val resolvedTarget = outcome.discoveredTarget ?: target
+        if (resolvedTarget != null && resolvedTarget.merchantId.isNotBlank()) {
+            saveHostTarget(resolvedTarget)
+        }
+        if (outcome.result is AccountResult.Ok) {
+            saveDomainSession(
+                SavedDomainSession(
+                    domain = domain,
+                    host = resolvedTarget?.host ?: effectiveHost,
+                    merchantId = resolvedTarget?.merchantId ?: effectiveMerchant,
+                    accessId = accessId,
+                    accessToken = accessToken,
+                    updatedAt = System.currentTimeMillis()
+                )
+            )
+            dao.updateMine(domain, true)
+        }
+        return outcome
+    }
 
     // --- Unified Domain Management ---
     suspend fun toggleMine(domain: String, currentlyMine: Boolean) = withContext(Dispatchers.IO) {
@@ -290,7 +434,7 @@ class VaultRepository(private val context: Context) {
 
     suspend fun hideDomains(domains: List<String>) = withContext(Dispatchers.IO) {
         if (domains.isNotEmpty()) {
-            dao.updateHidden(domains, true)
+            dao.updateHiddenChunked(domains, true)
         }
     }
 
@@ -314,14 +458,113 @@ class VaultRepository(private val context: Context) {
         )
     }
 
+    suspend fun saveHostTargetsBatch(targets: Collection<HostTarget>) = withContext(Dispatchers.IO) {
+        if (targets.isEmpty()) return@withContext
+        val now = System.currentTimeMillis()
+        targets.chunked(250).forEach { chunk ->
+            dao.upsertHostCaches(
+                chunk.map { target ->
+                    HostCacheEntity(
+                        domain = target.domain,
+                        resolvedHost = target.host,
+                        merchantId = target.merchantId,
+                        updatedAt = now
+                    )
+                }
+            )
+        }
+    }
+
     // --- Fetch Runs & Snapshots ---
     suspend fun loadRunResults(runId: Long): List<AccountResult> = withContext(Dispatchers.IO) {
-        dao.getSnapshotsForRun(runId).mapNotNull { decodeAccountResult(it.payloadJson) }
+        val out = ArrayList<AccountResult>()
+        val pageSize = 250
+        var offset = 0
+        while (true) {
+            val page = try {
+                dao.getSnapshotsForRunPaged(runId, pageSize, offset)
+            } catch (_: Throwable) {
+                break
+            }
+            if (page.isEmpty()) break
+            for (entity in page) {
+                decodeAccountResult(entity.payloadJson)?.let { out.add(it) }
+            }
+            if (page.size < pageSize) break
+            offset += pageSize
+        }
+        out
+    }
+
+    suspend fun loadLatestSnapshotsMap(): Map<String, AccountResult> = withContext(Dispatchers.IO) {
+        val out = LinkedHashMap<String, AccountResult>()
+        val pageSize = 250
+        var offset = 0
+        while (true) {
+            val page = try {
+                dao.getLatestSnapshotsPaged(pageSize, offset)
+            } catch (_: Throwable) {
+                break
+            }
+            if (page.isEmpty()) break
+            for (entity in page) {
+                decodeAccountResult(entity.payloadJson)?.let { decoded ->
+                    out[decoded.domain] = decoded
+                }
+            }
+            if (page.size < pageSize) break
+            offset += pageSize
+        }
+        out
     }
 
     suspend fun loadLatestRunResults(): List<AccountResult> = withContext(Dispatchers.IO) {
         val latest = dao.getLatestRun() ?: return@withContext emptyList()
         loadRunResults(latest.runId)
+    }
+
+    /**
+     * Updates a single in-progress FetchRunEntity row in place and inserts only [deltaRows]
+     * (newly processed domains since the previous flush) so large multi-thousand-domain scans
+     * never multiply snapshot rows in SQLite.
+     */
+    suspend fun persistRunProgress(
+        existingRunId: Long?,
+        startedAt: Long,
+        targetCount: Int,
+        allRows: Collection<AccountResult>,
+        deltaRows: List<AccountResult>
+    ): Long = withContext(Dispatchers.IO) {
+        val resolvedRunId = existingRunId?.takeIf { it > 0L && dao.getFetchRunById(it) != null } ?: 0L
+
+        var okCount = 0
+        var errCount = 0
+        var withData = 0
+        var totalCash = 0.0
+        for (row in allRows) {
+            when (row) {
+                is AccountResult.Ok -> {
+                    okCount++
+                    if (row.hasData) withData++
+                    totalCash += row.cash
+                }
+                is AccountResult.Err -> errCount++
+            }
+        }
+
+        val run = FetchRunEntity(
+            runId = resolvedRunId,
+            startedAt = startedAt,
+            completedAt = System.currentTimeMillis(),
+            targetCount = targetCount,
+            okCount = okCount,
+            withDataCount = withData,
+            errCount = errCount,
+            totalCash = totalCash
+        )
+
+        val deltaSnapshots = deltaRows.map { toSnapshotEntity(it) }
+        dao.upsertRunProgress(run, deltaSnapshots)
     }
 
     suspend fun persistFetchRun(startedAt: Long, targetCount: Int, rows: List<AccountResult>): Long =
@@ -341,41 +584,40 @@ class VaultRepository(private val context: Context) {
                 totalCash = totalCash
             )
 
-            val snapshots = rows.map { row ->
-                when (row) {
-                    is AccountResult.Ok -> AccountSnapshotEntity(
-                        runId = 0L,
-                        domain = row.domain,
-                        isOk = true,
-                        hasData = row.hasData,
-                        cash = row.cash,
-                        cashWalletName = row.cashWalletName,
-                        errorCode = null,
-                        errorMessage = null,
-                        latencyMs = row.latencyMs,
-                        retriesUsed = row.retriesUsed,
-                        fetchedAt = row.fetchedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
-                        payloadJson = json.encodeToString<AccountResult>(row)
-                    )
-                    is AccountResult.Err -> AccountSnapshotEntity(
-                        runId = 0L,
-                        domain = row.domain,
-                        isOk = false,
-                        hasData = false,
-                        cash = 0.0,
-                        cashWalletName = "",
-                        errorCode = row.code,
-                        errorMessage = row.message,
-                        latencyMs = row.latencyMs,
-                        retriesUsed = row.retriesUsed,
-                        fetchedAt = row.fetchedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
-                        payloadJson = json.encodeToString<AccountResult>(row)
-                    )
-                }
-            }
-
+            val snapshots = rows.map { toSnapshotEntity(it) }
             dao.saveCompletedRun(run, snapshots)
         }
+
+    private fun toSnapshotEntity(row: AccountResult): AccountSnapshotEntity = when (row) {
+        is AccountResult.Ok -> AccountSnapshotEntity(
+            runId = 0L,
+            domain = row.domain,
+            isOk = true,
+            hasData = row.hasData,
+            cash = row.cash,
+            cashWalletName = row.cashWalletName,
+            errorCode = null,
+            errorMessage = null,
+            latencyMs = row.latencyMs,
+            retriesUsed = row.retriesUsed,
+            fetchedAt = row.fetchedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
+            payloadJson = json.encodeToString<AccountResult>(row)
+        )
+        is AccountResult.Err -> AccountSnapshotEntity(
+            runId = 0L,
+            domain = row.domain,
+            isOk = false,
+            hasData = false,
+            cash = 0.0,
+            cashWalletName = "",
+            errorCode = row.code,
+            errorMessage = row.message,
+            latencyMs = row.latencyMs,
+            retriesUsed = row.retriesUsed,
+            fetchedAt = row.fetchedAt.takeIf { it > 0L } ?: System.currentTimeMillis(),
+            payloadJson = json.encodeToString<AccountResult>(row)
+        )
+    }
 
     // --- Public Bonuses ---
     suspend fun savePublicBonusResult(result: PublicCatalogueResult) = withContext(Dispatchers.IO) {
@@ -388,6 +630,24 @@ class VaultRepository(private val context: Context) {
                 fetchedAt = System.currentTimeMillis()
             )
         )
+    }
+
+    suspend fun savePublicBonusResultsBatch(results: Collection<PublicCatalogueResult>) = withContext(Dispatchers.IO) {
+        if (results.isEmpty()) return@withContext
+        val now = System.currentTimeMillis()
+        results.chunked(100).forEach { chunk ->
+            dao.upsertPublicBonuses(
+                chunk.map { result ->
+                    PublicBonusCacheEntity(
+                        domain = result.domain,
+                        ok = result.ok,
+                        bonusesJson = json.encodeToString(result.bonuses),
+                        errorMessage = result.message,
+                        fetchedAt = now
+                    )
+                }
+            )
+        }
     }
 
     // --- Domain Health ---
@@ -454,7 +714,7 @@ class VaultRepository(private val context: Context) {
             latestAccounts = latestOk,
             credentials = creds
         )
-        json.encodeToString(payload)
+        prettyJson.encodeToString(payload)
     }
 
     suspend fun importVaultJson(rawJson: String): Result<String> = withContext(Dispatchers.IO) {
@@ -464,13 +724,13 @@ class VaultRepository(private val context: Context) {
                 addDomains(payload.customSites.map { it.domain }, markAsMine = false)
             }
             if (payload.mineDomains.isNotEmpty()) {
-                dao.markAllMine(payload.mineDomains.map { DomainUtil.normalizeDomain(it) })
+                dao.markAllMineChunked(payload.mineDomains.map { DomainUtil.normalizeDomain(it) })
             }
             for (visited in payload.visitedDomains) {
                 dao.updateVisited(DomainUtil.normalizeDomain(visited), true)
             }
             if (payload.hiddenDomains.isNotEmpty()) {
-                dao.updateHidden(payload.hiddenDomains.map { DomainUtil.normalizeDomain(it) }, true)
+                dao.updateHiddenChunked(payload.hiddenDomains.map { DomainUtil.normalizeDomain(it) }, true)
             }
             prefsStore.setTheme(payload.themeId)
             payload.credentials?.let { creds ->

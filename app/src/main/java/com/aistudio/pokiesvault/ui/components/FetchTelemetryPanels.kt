@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
+import com.aistudio.pokiesvault.ui.viewmodel.BonusFinderUiState
 import com.aistudio.pokiesvault.ui.viewmodel.EgressUiState
 import com.aistudio.pokiesvault.ui.viewmodel.FetcherUiState
 
@@ -50,7 +51,8 @@ import com.aistudio.pokiesvault.ui.viewmodel.FetcherUiState
 fun OutgoingIpCard(
     egressState: EgressUiState,
     onRefresh: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    noteText: String = "Sign-in from this device · casinos see this IP"
 ) {
     val palette = LocalVaultPalette.current
     val info = egressState.info
@@ -221,7 +223,7 @@ fun OutgoingIpCard(
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Sign-in from this device · casinos see this IP",
+                    text = noteText,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1,
@@ -243,10 +245,10 @@ fun LiveFetchStatsCard(
     } else {
         0
     }
-    val signedIn = state.validAccounts.size + state.emptyAccounts.size
-    val rejected = state.rejectedAccounts.size
-    val withBalance = state.validAccounts.count { it.cash > 0.001 }
-    val nothingWaiting = state.emptyAccounts.size
+    val signedIn = state.rawSignedInCount
+    val rejected = state.rawRejectedCount
+    val withBalance = state.rawWithBalanceCount
+    val nothingWaiting = state.rawNothingWaitingCount
     val queue = if (state.isFetching) {
         (state.progressTotal - state.progressDone - state.activeWorkers).coerceAtLeast(0)
     } else {
@@ -300,19 +302,39 @@ fun LiveFetchStatsCard(
             Text(
                 text = state.liveStatusLabel,
                 color = when {
+                    state.cooldownSeconds > 0 -> palette.slow
                     state.isFetching -> palette.accentA
                     state.liveStatusLabel.contains("WAF", ignoreCase = true) -> palette.slow
                     state.liveStatusLabel.startsWith("Paused", ignoreCase = true) -> palette.accentA
                     else -> MaterialTheme.colorScheme.onSurfaceVariant
                 },
                 style = MaterialTheme.typography.bodyMedium,
-                fontWeight = if (state.liveStatusLabel.contains("WAF", ignoreCase = true)) {
+                fontWeight = if (state.cooldownSeconds > 0 || state.liveStatusLabel.contains("WAF", ignoreCase = true)) {
                     FontWeight.SemiBold
                 } else {
                     FontWeight.Normal
                 },
                 modifier = Modifier.testTag("live_fetch_status_line")
             )
+
+            if (state.cooldownSeconds > 0) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.slow.copy(alpha = 0.14f),
+                    border = BorderStroke(1.dp, palette.slow.copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("live_fetch_cooldown_banner")
+                ) {
+                    Text(
+                        text = "${state.cooldownReason.ifBlank { "Auto-cooldown" }} · resuming automatically in ${state.cooldownSeconds}s",
+                        color = palette.slow,
+                        style = MonoTextStyles.metricSmall,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                    )
+                }
+            }
 
             Text(
                 text = "$signedIn signed in · $rejected rejected · $withBalance with a balance · $nothingWaiting nothing waiting",
@@ -335,11 +357,125 @@ fun LiveFetchStatsCard(
                 modifier = Modifier.testTag("live_fetch_timing_line")
             )
 
+            val sessionSuffix = when {
+                state.sessionReusedCount > 0 -> " · ${state.sessionReusedCount} sessions reused"
+                state.savedSessionDomains.isNotEmpty() -> " · ${state.savedSessionDomains.size} saved sessions"
+                else -> ""
+            }
+            Text(
+                text = "Retries ${state.totalRetries} · attempts ${state.totalAttempts}$sessionSuffix",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
+                modifier = Modifier.testTag("live_fetch_retries_line")
+            )
+        }
+    }
+}
+
+@Composable
+fun LiveBonusScanStatsCard(
+    state: BonusFinderUiState,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalVaultPalette.current
+    val percent = if (state.progressTotal > 0) {
+        ((state.progressDone * 100) / state.progressTotal).coerceIn(0, 100)
+    } else {
+        0
+    }
+    val queue = if (state.isScanning) {
+        (state.progressTotal - state.progressDone - state.activeWorkers).coerceAtLeast(0)
+    } else {
+        0
+    }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("live_bonus_stats_card"),
+        shape = RoundedCornerShape(18.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(
+                text = "LIVE BONUS SCAN",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.6.sp
+                )
+            )
+
+            Spacer(modifier = Modifier.height(2.dp))
+
+            Text(
+                text = "From this phone",
+                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 19.sp
+                )
+            )
+
+            Text(
+                text = "${state.progressDone} / ${state.progressTotal} processed · $percent%",
+                color = MaterialTheme.colorScheme.onSurface,
+                style = MonoTextStyles.balanceLarge.copy(
+                    fontSize = 19.sp,
+                    fontWeight = FontWeight.Medium
+                ),
+                modifier = Modifier.testTag("live_bonus_processed_line")
+            )
+
+            Text(
+                text = state.liveStatusLabel,
+                color = when {
+                    state.isScanning -> palette.accentA
+                    state.liveStatusLabel.contains("WAF", ignoreCase = true) -> palette.slow
+                    state.liveStatusLabel.startsWith("Paused", ignoreCase = true) -> palette.accentA
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = if (state.liveStatusLabel.contains("WAF", ignoreCase = true)) {
+                    FontWeight.SemiBold
+                } else {
+                    FontWeight.Normal
+                },
+                modifier = Modifier.testTag("live_bonus_status_line")
+            )
+
+            Text(
+                text = "${state.loadedTotalCount} loaded · ${state.failedTotalCount} failed · ${state.withOffersCount} with offers · ${state.unloadedTotalCount} unloaded",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.testTag("live_bonus_outcome_line")
+            )
+
+            Text(
+                text = "Queue $queue · workers ${state.activeWorkers} · peak ${state.peakWorkers}",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
+                modifier = Modifier.testTag("live_bonus_workers_line")
+            )
+
+            Text(
+                text = "Wall ${state.wallElapsedSec}s · scan ${state.scanElapsedSec}s",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
+                modifier = Modifier.testTag("live_bonus_timing_line")
+            )
+
             Text(
                 text = "Retries ${state.totalRetries} · attempts ${state.totalAttempts}",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
-                modifier = Modifier.testTag("live_fetch_retries_line")
+                modifier = Modifier.testTag("live_bonus_retries_line")
             )
         }
     }

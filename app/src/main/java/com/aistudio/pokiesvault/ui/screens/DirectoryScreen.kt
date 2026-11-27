@@ -49,11 +49,12 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aistudio.pokiesvault.R
 import com.aistudio.pokiesvault.data.model.BonusMode
+import com.aistudio.pokiesvault.data.model.CardColor
 import com.aistudio.pokiesvault.data.model.SortMode
 import com.aistudio.pokiesvault.data.model.ViewMode
+import com.aistudio.pokiesvault.ui.components.DomainWalletCard
 import com.aistudio.pokiesvault.ui.components.EmptyStateCard
 import com.aistudio.pokiesvault.ui.components.ResponsibleGamblingFooter
-import com.aistudio.pokiesvault.ui.components.SiteCard
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
 import com.aistudio.pokiesvault.ui.viewmodel.VaultViewModel
@@ -141,25 +142,11 @@ fun DirectoryScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         VaultFilterChip(
-                            label = "My accounts (${state.mineCount})",
-                            selected = prefs.mineOnly,
-                            icon = Icons.Default.Bookmark,
-                            onClick = { viewModel.toggleMineOnly() },
-                            tag = "chip_mine_only"
-                        )
-                        VaultFilterChip(
-                            label = "Unvisited",
+                            label = if (prefs.notVisited) "Not Visited: On" else "Not Visited: Off",
                             selected = prefs.notVisited,
                             icon = Icons.Default.VisibilityOff,
                             onClick = { viewModel.toggleNotVisited() },
                             tag = "chip_not_visited"
-                        )
-                        VaultFilterChip(
-                            label = "Wallets",
-                            selected = prefs.wallets,
-                            icon = Icons.Default.AccountBalanceWallet,
-                            onClick = { viewModel.toggleWallets() },
-                            tag = "chip_wallets"
                         )
                         VaultFilterChip(
                             label = "View: ${prefs.viewMode.label}",
@@ -169,11 +156,38 @@ fun DirectoryScreen(
                             tag = "chip_view_mode"
                         )
                         VaultFilterChip(
-                            label = "Sort & badges",
-                            selected = prefs.sortMode != SortMode.DEFAULT || prefs.bonusMode != BonusMode.NONE,
+                            label = if (prefs.wallets) "Wallets: On" else "Wallets: Off",
+                            selected = prefs.wallets,
+                            icon = Icons.Default.AccountBalanceWallet,
+                            onClick = { viewModel.toggleWallets() },
+                            tag = "chip_wallets"
+                        )
+                        val hasActiveSortFilter = prefs.sortMode != SortMode.DEFAULT ||
+                            prefs.bonusMode != BonusMode.NONE ||
+                            prefs.cardColor != CardColor.CLASSIC ||
+                            prefs.signupOnly
+                        val sortChipLabel = buildString {
+                            append("⇅ ")
+                            append(
+                                if (prefs.sortMode == SortMode.DEFAULT) "Sort / Filter" else prefs.sortMode.shortLabel
+                            )
+                            if (prefs.bonusMode != BonusMode.NONE) {
+                                append(" · ${prefs.bonusMode.emoji}")
+                            }
+                        }
+                        VaultFilterChip(
+                            label = sortChipLabel,
+                            selected = hasActiveSortFilter,
                             icon = Icons.Default.Tune,
                             onClick = { viewModel.setSortFilterOpen(true) },
                             tag = "chip_sort_filter"
+                        )
+                        VaultFilterChip(
+                            label = "My accounts (${state.mineCount})",
+                            selected = prefs.mineOnly,
+                            icon = Icons.Default.Bookmark,
+                            onClick = { viewModel.toggleMineOnly() },
+                            tag = "chip_mine_only"
                         )
                     }
 
@@ -183,8 +197,12 @@ fun DirectoryScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val activeSummary = buildString {
+                            append("${state.totalSitesCount} sites · ${state.visitedCount} visited")
+                            if (prefs.signupOnly) append(" · Signup only")
+                        }
                         Text(
-                            text = "${state.totalSitesCount} sites · ${state.visitedCount} visited",
+                            text = activeSummary,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MonoTextStyles.metricSmall
                         )
@@ -256,8 +274,12 @@ fun DirectoryScreen(
                                         LaunchedEffect(item.site.domain) {
                                             viewModel.enqueueStatusProbeIfStale(item.site.domain)
                                         }
-                                        SiteCard(
+                                        DomainWalletCard(
                                             item = item,
+                                            walletMode = prefs.wallets,
+                                            bonusMode = prefs.bonusMode,
+                                            cardColor = prefs.cardColor,
+                                            sortMode = prefs.sortMode,
                                             compact = false,
                                             onCardClick = { viewModel.markVisited(item.site.domain) },
                                             onDetailClick = { viewModel.openSiteDetail(item.site.domain) },
@@ -273,8 +295,12 @@ fun DirectoryScreen(
                                 LaunchedEffect(item.site.domain) {
                                     viewModel.enqueueStatusProbeIfStale(item.site.domain)
                                 }
-                                SiteCard(
+                                DomainWalletCard(
                                     item = item,
+                                    walletMode = prefs.wallets,
+                                    bonusMode = prefs.bonusMode,
+                                    cardColor = prefs.cardColor,
+                                    sortMode = prefs.sortMode,
                                     compact = false,
                                     onCardClick = { viewModel.markVisited(item.site.domain) },
                                     onDetailClick = { viewModel.openSiteDetail(item.site.domain) },
@@ -298,8 +324,12 @@ fun DirectoryScreen(
                                 LaunchedEffect(item.site.domain) {
                                     viewModel.enqueueStatusProbeIfStale(item.site.domain)
                                 }
-                                SiteCard(
+                                DomainWalletCard(
                                     item = item,
+                                    walletMode = prefs.wallets,
+                                    bonusMode = prefs.bonusMode,
+                                    cardColor = prefs.cardColor,
+                                    sortMode = prefs.sortMode,
                                     compact = prefs.viewMode == ViewMode.TWO,
                                     onCardClick = { viewModel.markVisited(item.site.domain) },
                                     onDetailClick = { viewModel.openSiteDetail(item.site.domain) },
@@ -317,8 +347,12 @@ fun DirectoryScreen(
                         LaunchedEffect(item.site.domain) {
                             viewModel.enqueueStatusProbeIfStale(item.site.domain)
                         }
-                        SiteCard(
+                        DomainWalletCard(
                             item = item,
+                            walletMode = prefs.wallets,
+                            bonusMode = prefs.bonusMode,
+                            cardColor = prefs.cardColor,
+                            sortMode = prefs.sortMode,
                             compact = false,
                             onCardClick = { viewModel.markVisited(item.site.domain) },
                             onDetailClick = { viewModel.openSiteDetail(item.site.domain) },

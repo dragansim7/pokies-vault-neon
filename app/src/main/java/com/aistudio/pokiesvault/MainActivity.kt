@@ -1,5 +1,8 @@
 package com.aistudio.pokiesvault
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,21 +22,26 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CardGiftcard
 import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.CardGiftcard
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.ui.draw.clip
+import androidx.core.content.ContextCompat
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -80,6 +88,7 @@ import com.aistudio.pokiesvault.ui.components.AddDomainDialog
 import com.aistudio.pokiesvault.ui.components.AppDrawer
 import com.aistudio.pokiesvault.ui.components.ConfirmScanDialog
 import com.aistudio.pokiesvault.ui.components.FetchHistorySheet
+import com.aistudio.pokiesvault.ui.components.NotVisitedSignInAlertDialog
 import com.aistudio.pokiesvault.ui.components.SiteDetailSheet
 import com.aistudio.pokiesvault.ui.components.SortFilterSheet
 import com.aistudio.pokiesvault.ui.navigation.BonusesRoute
@@ -199,6 +208,34 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val notificationPermissionLauncher = rememberLauncherForActivityResult(
+                    contract = ActivityResultContracts.RequestPermission()
+                ) { granted ->
+                    viewModel.setAllowBackgroundRuns(true)
+                    if (!granted) {
+                        viewModel.emitMessage("Background runs enabled (enable notifications in system settings to see progress bar).")
+                    }
+                }
+
+                fun toggleBackgroundRuns() {
+                    val turningOn = !globalState.allowBackgroundRuns
+                    if (!turningOn) {
+                        viewModel.setAllowBackgroundRuns(false)
+                        return
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        val hasPerm = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.POST_NOTIFICATIONS
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (!hasPerm) {
+                            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            return
+                        }
+                    }
+                    viewModel.setAllowBackgroundRuns(true)
+                }
+
                 LaunchedEffect(Unit) {
                     viewModel.snackbarEvents.collect { msg ->
                         snackbarHostState.showSnackbar(msg)
@@ -244,7 +281,10 @@ class MainActivity : ComponentActivity() {
                         Scaffold(
                             topBar = {
                                 VaultTopBar(
+                                    allowBackgroundRuns = globalState.allowBackgroundRuns,
+                                    hasActiveBackgroundRun = globalState.hasActiveBackgroundRun,
                                     onTitleClick = { navigateTo(DirectoryRoute) },
+                                    onToggleBackgroundRuns = { toggleBackgroundRuns() },
                                     onSettingsClick = { scope.launch { drawerState.open() } }
                                 )
                             },
@@ -319,11 +359,23 @@ class MainActivity : ComponentActivity() {
                     SortFilterSheet(
                         currentSort = dirState.preferences.sortMode,
                         currentBonus = dirState.preferences.bonusMode,
+                        currentCardColor = dirState.preferences.cardColor,
+                        notVisited = dirState.preferences.notVisited,
+                        signupOnly = dirState.preferences.signupOnly,
                         mineOnly = dirState.preferences.mineOnly,
-                        onSortSelected = { viewModel.setSortMode(it) },
-                        onBonusSelected = { viewModel.setBonusMode(it) },
-                        onMineOnlyToggled = { viewModel.toggleMineOnly() },
+                        onCardColorSelected = { viewModel.setCardColor(it) },
+                        onApply = { sort, bonus, notVis, signup, mine ->
+                            viewModel.applySortFilter(sort, bonus, notVis, signup, mine)
+                        },
+                        onReset = { viewModel.resetSortFilter() },
                         onDismiss = { viewModel.setSortFilterOpen(false) }
+                    )
+                }
+
+                if (globalState.isNotVisitedAuthAlertOpen) {
+                    NotVisitedSignInAlertDialog(
+                        onGoToFetcher = { navigateTo(FetcherRoute) },
+                        onDismiss = { viewModel.setNotVisitedAuthAlertOpen(false) }
                     )
                 }
 
@@ -350,6 +402,9 @@ class MainActivity : ComponentActivity() {
                     if (detailItem != null) {
                         SiteDetailSheet(
                             item = detailItem,
+                            bonusMode = dirState.preferences.bonusMode,
+                            cardColor = dirState.preferences.cardColor,
+                            sortMode = dirState.preferences.sortMode,
                             onFetchNow = { d ->
                                 navigateTo(FetcherRoute)
                                 viewModel.startFetch(listOf(d))
@@ -366,7 +421,10 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun VaultTopBar(
+    allowBackgroundRuns: Boolean,
+    hasActiveBackgroundRun: Boolean,
     onTitleClick: () -> Unit,
+    onToggleBackgroundRuns: () -> Unit,
     onSettingsClick: () -> Unit
 ) {
     val palette = LocalVaultPalette.current
@@ -398,23 +456,84 @@ private fun VaultTopBar(
                     .testTag("brand_title")
             )
 
-            Surface(
-                shape = MaterialTheme.shapes.small,
-                color = MaterialTheme.colorScheme.surface,
-                border = BorderStroke(1.dp, palette.accentB.copy(alpha = 0.6f))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                IconButton(
-                    onClick = onSettingsClick,
+                val bgTint = if (allowBackgroundRuns) {
+                    if (hasActiveBackgroundRun) palette.live else palette.accentA
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = if (allowBackgroundRuns) {
+                        bgTint.copy(alpha = 0.16f)
+                    } else {
+                        MaterialTheme.colorScheme.surface
+                    },
+                    border = BorderStroke(
+                        width = if (allowBackgroundRuns) 1.3.dp else 1.dp,
+                        color = if (allowBackgroundRuns) bgTint.copy(alpha = 0.8f) else MaterialTheme.colorScheme.outline
+                    ),
                     modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("nav_settings_btn")
+                        .heightIn(min = 48.dp)
+                        .clickable { onToggleBackgroundRuns() }
+                        .testTag("bg_runs_toggle_btn")
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Tune,
-                        contentDescription = stringResource(R.string.open_settings),
-                        tint = palette.accentA,
-                        modifier = Modifier.size(20.dp)
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        if (hasActiveBackgroundRun) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .clip(CircleShape)
+                                    .background(palette.live)
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.Sync,
+                                contentDescription = stringResource(R.string.bg_runs_toggle_cd),
+                                tint = bgTint,
+                                modifier = Modifier.size(15.dp)
+                            )
+                        }
+                        Text(
+                            text = if (allowBackgroundRuns) {
+                                stringResource(R.string.bg_runs_on_label)
+                            } else {
+                                stringResource(R.string.bg_runs_off_label)
+                            },
+                            color = bgTint,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.ExtraBold,
+                                letterSpacing = 0.6.sp
+                            )
+                        )
+                    }
+                }
+
+                Surface(
+                    shape = MaterialTheme.shapes.small,
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, palette.accentB.copy(alpha = 0.6f))
+                ) {
+                    IconButton(
+                        onClick = onSettingsClick,
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .testTag("nav_settings_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Tune,
+                            contentDescription = stringResource(R.string.open_settings),
+                            tint = palette.accentA,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }

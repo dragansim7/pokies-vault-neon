@@ -369,7 +369,8 @@ fun AccountResultCard(
                 Spacer(modifier = Modifier.weight(1f))
             }
 
-            if (row.availableBonuses.isNotEmpty()) {
+            val litBonuses = remember(row) { com.aistudio.pokiesvault.util.SiteOrderUtil.litClaimableBonuses(row) }
+            if (litBonuses.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(10.dp))
                 Surface(
                     modifier = Modifier
@@ -386,7 +387,7 @@ fun AccountResultCard(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "All available bonuses (${row.availableBonuses.size})",
+                                text = "Lit claimable bonuses (${litBonuses.size})",
                                 color = MaterialTheme.colorScheme.onSurface,
                                 style = MaterialTheme.typography.labelMedium
                             )
@@ -403,7 +404,11 @@ fun AccountResultCard(
                             exit = shrinkVertically(spring(stiffness = Spring.StiffnessMediumLow))
                         ) {
                             Column(modifier = Modifier.padding(top = 8.dp)) {
-                                row.availableBonuses.forEach { bonus ->
+                                litBonuses.forEach { bonus ->
+                                    val turnStr = com.aistudio.pokiesvault.util.SiteOrderUtil.formatTurnover(
+                                        com.aistudio.pokiesvault.util.SiteOrderUtil.bonusTurnover(bonus)
+                                    )
+                                    val appTag = if (bonus.mobileAppOnly) " [APP]" else ""
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -412,7 +417,7 @@ fun AccountResultCard(
                                         verticalAlignment = Alignment.CenterVertically
                                     ) {
                                         Text(
-                                            text = bonus.name + if (bonus.rollover != null) " · ${bonus.rollover.toInt()}×" else "",
+                                            text = bonus.name + appTag + if (turnStr.isNotBlank()) " · $turnStr" else "",
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                                             style = MaterialTheme.typography.bodySmall,
                                             maxLines = 1,
@@ -421,7 +426,7 @@ fun AccountResultCard(
                                         )
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = bonus.amountDisplay,
+                                            text = bonus.amountDisplay.ifBlank { "?" },
                                             color = palette.accentA,
                                             style = MonoTextStyles.metricSmall,
                                             fontWeight = FontWeight.Bold
@@ -444,6 +449,7 @@ fun BonusGridItem(
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVaultPalette.current
+    val isLit = com.aistudio.pokiesvault.util.SiteOrderUtil.isLitBonus(bonus)
     Surface(
         modifier = modifier,
         shape = MaterialTheme.shapes.small,
@@ -457,9 +463,9 @@ fun BonusGridItem(
                 maxLines = 1
             )
             Spacer(modifier = Modifier.height(2.dp))
-            if (bonus != null) {
+            if (isLit && bonus != null) {
                 Text(
-                    text = bonus.amountDisplay,
+                    text = bonus.amountDisplay.ifBlank { "?" },
                     color = palette.live,
                     style = MonoTextStyles.metricSmall,
                     fontWeight = FontWeight.Bold,

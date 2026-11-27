@@ -46,11 +46,25 @@ function runNext() {
   if (job) job();
 }
 
-export function SiteIcon({ domain }: { domain: string }) {
+export function SiteIcon({
+  domain,
+  className = "site-icon",
+  onSrcChange,
+}: {
+  domain: string;
+  className?: string;
+  onSrcChange?: (src: string) => void;
+}) {
   const lookup = useServerFn(lookupSiteIconFn);
   const lookupRef = useRef(lookup);
   lookupRef.current = lookup;
+  const onSrcRef = useRef(onSrcChange);
+  onSrcRef.current = onSrcChange;
   const [src, setSrc] = useState(() => remembered(domain) || "");
+
+  useEffect(() => {
+    if (src) onSrcRef.current?.(src);
+  }, [src]);
 
   useEffect(() => {
     const known = remembered(domain);
@@ -93,11 +107,11 @@ export function SiteIcon({ domain }: { domain: string }) {
     };
   }, [domain]);
 
-  if (!src) return <span className="site-icon" />;
+  if (!src) return <span className={className} />;
 
   return (
     <img
-      className="site-icon"
+      className={className}
       src={src}
       alt=""
       referrerPolicy="no-referrer"

@@ -18,7 +18,9 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.PlayArrow
@@ -31,12 +33,15 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -46,29 +51,49 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.compositeOver
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.aistudio.pokiesvault.R
 import com.aistudio.pokiesvault.data.model.CheckpointPauseReason
 import com.aistudio.pokiesvault.data.model.FetchCheckpoint
 import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
 import com.aistudio.pokiesvault.ui.viewmodel.RejectedReasonGroup
+import com.aistudio.pokiesvault.util.BatteryOptimizationHelper
+
+enum class SpeedSelectorMode {
+    FETCHER,
+    BONUS_FINDER
+}
 
 /**
- * Interactive 3-tier speed selector (Gentle / Safe / Balanced) that tunes worker count and launch gap.
+ * Interactive 3-tier speed selector (Slow (Safe) / Medium (Default) / Fast (Caution))
+ * that tunes worker concurrency and per-IP spacing independently for Fetcher and Bonus Finder.
  */
 @Composable
 fun SpeedPresetSelector(
     selected: FetchSpeedPreset,
     enabled: Boolean,
     onSelect: (FetchSpeedPreset) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    title: String = "FETCH SPEED PRESET",
+    tagPrefix: String = "speed_preset",
+    mode: SpeedSelectorMode = SpeedSelectorMode.FETCHER
 ) {
     val palette = LocalVaultPalette.current
+    val headerMetric = when (mode) {
+        SpeedSelectorMode.FETCHER -> selected.fetcherSubtitle
+        SpeedSelectorMode.BONUS_FINDER -> selected.bonusSubtitle
+    }
 
     Column(modifier = modifier.fillMaxWidth()) {
         Row(
@@ -77,7 +102,7 @@ fun SpeedPresetSelector(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "FETCH SPEED PRESET",
+                text = title,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.labelSmall.copy(
                     fontWeight = FontWeight.Bold,
@@ -85,7 +110,7 @@ fun SpeedPresetSelector(
                 )
             )
             Text(
-                text = selected.subtitle,
+                text = headerMetric,
                 color = palette.accentA,
                 style = MonoTextStyles.metricSmall,
                 fontWeight = FontWeight.Bold
@@ -111,33 +136,55 @@ fun SpeedPresetSelector(
                     MaterialTheme.colorScheme.outline
                 }
 
+                val isCaution = preset == FetchSpeedPreset.BALANCED
+                val badgeColor = when {
+                    isCaution -> palette.slow
+                    isSelected -> palette.accentA.copy(alpha = 0.88f)
+                    else -> MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                val chipMetric = when (mode) {
+                    SpeedSelectorMode.FETCHER -> preset.fetcherChipMetric
+                    SpeedSelectorMode.BONUS_FINDER -> preset.bonusChipMetric
+                }
+
                 Surface(
                     shape = RoundedCornerShape(12.dp),
                     color = containerColor,
                     border = BorderStroke(if (isSelected) 1.5.dp else 1.dp, borderColor),
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 52.dp)
-                        .testTag("speed_preset_${preset.name.lowercase()}")
+                        .heightIn(min = 64.dp)
+                        .testTag("${tagPrefix}_${preset.name.lowercase()}")
                         .clickable(enabled = enabled) { onSelect(preset) }
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                            .padding(horizontal = 6.dp, vertical = 8.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
                     ) {
                         Text(
-                            text = preset.displayName,
+                            text = preset.tierTitle,
                             color = if (isSelected) palette.accentA else MaterialTheme.colorScheme.onSurface,
                             style = MaterialTheme.typography.labelLarge,
                             fontWeight = FontWeight.ExtraBold,
-                            maxLines = 1
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
-                        Spacer(modifier = Modifier.height(2.dp))
                         Text(
-                            text = "${preset.initialWorkers}–${preset.maxWorkers}w · ${formatGapLabel(preset.startGapMs)}",
+                            text = preset.tierBadge,
+                            color = badgeColor,
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.height(3.dp))
+                        Text(
+                            text = chipMetric,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MonoTextStyles.metricSmall.copy(fontSize = 10.sp),
                             maxLines = 1,
@@ -145,6 +192,110 @@ fun SpeedPresetSelector(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Subtle, Play-compliant battery settings shortcut shown when Background Runs is ON
+ * and Android currently applies battery optimization restrictions to Pokies Vault.
+ */
+@Composable
+fun BackgroundBatteryHintBanner(
+    allowBackgroundRuns: Boolean,
+    modifier: Modifier = Modifier,
+    tagPrefix: String = ""
+) {
+    if (!allowBackgroundRuns) return
+
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val palette = LocalVaultPalette.current
+    var dismissed by remember { mutableStateOf(false) }
+    var isUnrestricted by remember {
+        mutableStateOf(BatteryOptimizationHelper.isIgnoringBatteryOptimizations(context))
+    }
+
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isUnrestricted = BatteryOptimizationHelper.isIgnoringBatteryOptimizations(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    if (isUnrestricted || dismissed) return
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("${tagPrefix}bg_battery_hint_banner"),
+        shape = RoundedCornerShape(14.dp),
+        color = palette.slow.copy(alpha = 0.09f).compositeOver(MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, palette.slow.copy(alpha = 0.5f))
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.BatteryChargingFull,
+                contentDescription = null,
+                tint = palette.slow,
+                modifier = Modifier.size(18.dp)
+            )
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.bg_battery_hint_title),
+                    color = MaterialTheme.colorScheme.onSurface,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "Set Battery → Unrestricted to keep minimized scans alive.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            OutlinedButton(
+                onClick = { BatteryOptimizationHelper.openBatterySettings(context) },
+                border = BorderStroke(1.dp, palette.slow),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                shape = MaterialTheme.shapes.small,
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("${tagPrefix}bg_battery_settings_btn")
+            ) {
+                Text(
+                    text = stringResource(R.string.bg_battery_hint_action),
+                    color = palette.slow,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.ExtraBold,
+                    maxLines = 1
+                )
+            }
+            IconButton(
+                onClick = { dismissed = true },
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("${tagPrefix}bg_battery_dismiss_btn")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Dismiss battery hint",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
     }
@@ -173,7 +324,9 @@ fun WafPauseAndCheckpointBanner(
     onRefreshIp: () -> Unit,
     onResume: () -> Unit,
     onDiscard: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    resumeLabelPrefix: String = "Resume",
+    tagPrefix: String = ""
 ) {
     val palette = LocalVaultPalette.current
     val isWafPause = checkpoint.pauseReason == CheckpointPauseReason.WAF_BLOCKED
@@ -191,7 +344,7 @@ fun WafPauseAndCheckpointBanner(
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .testTag("checkpoint_banner"),
+            .testTag("${tagPrefix}checkpoint_banner"),
         shape = RoundedCornerShape(18.dp),
         color = bgTint,
         border = BorderStroke(1.2.dp, accentColor.copy(alpha = 0.65f))
@@ -265,7 +418,7 @@ fun WafPauseAndCheckpointBanner(
                             style = MaterialTheme.typography.bodySmall
                         )
                         Text(
-                            text = "2. Tap Refresh IP below, consider switching to Gentle mode, then Resume Remaining.",
+                            text = "2. Tap Refresh IP below, consider switching to Slow (Safe) mode, then Resume Remaining.",
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             style = MaterialTheme.typography.bodySmall
                         )
@@ -320,7 +473,7 @@ fun WafPauseAndCheckpointBanner(
                     modifier = Modifier
                         .weight(1.4f)
                         .heightIn(min = 48.dp)
-                        .testTag("resume_checkpoint_btn")
+                        .testTag("${tagPrefix}resume_checkpoint_btn")
                 ) {
                     Icon(
                         imageVector = Icons.Default.PlayArrow,
@@ -329,7 +482,7 @@ fun WafPauseAndCheckpointBanner(
                     )
                     Spacer(modifier = Modifier.width(4.dp))
                     Text(
-                        text = "Resume ($remainingCount)",
+                        text = "$resumeLabelPrefix ($remainingCount)",
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 1
                     )
@@ -374,7 +527,7 @@ fun WafPauseAndCheckpointBanner(
                     enabled = !isFetching,
                     modifier = Modifier
                         .heightIn(min = 48.dp)
-                        .testTag("discard_checkpoint_btn")
+                        .testTag("${tagPrefix}discard_checkpoint_btn")
                 ) {
                     Text(
                         text = "Discard",
@@ -399,6 +552,7 @@ fun GroupedRejectedSection(
     isFetching: Boolean,
     onRetryCode: (String) -> Unit,
     onRetryAllRecoverable: () -> Unit,
+    onSolveCaptcha: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val palette = LocalVaultPalette.current
@@ -622,7 +776,26 @@ fun GroupedRejectedSection(
                                             overflow = TextOverflow.Ellipsis
                                         )
                                     }
-                                    if (err.latencyMs > 0L) {
+                                    if (group.code == "captcha") {
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        OutlinedButton(
+                                            onClick = { onSolveCaptcha(err.domain) },
+                                            enabled = !isFetching,
+                                            border = BorderStroke(1.dp, palette.accentC),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            shape = MaterialTheme.shapes.small,
+                                            modifier = Modifier
+                                                .heightIn(min = 48.dp)
+                                                .testTag("solve_captcha_${err.domain}")
+                                        ) {
+                                            Text(
+                                                text = "Solve Captcha",
+                                                color = palette.accentC,
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    } else if (err.latencyMs > 0L) {
                                         Text(
                                             text = "${err.latencyMs}ms",
                                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -670,10 +843,10 @@ private fun reasonToneColor(code: String): Color {
 
 private fun reasonHintText(code: String): String = when (code) {
     "blocked" -> "Firewall or WAF rejected request · retry after cooldown or IP change"
-    "rate_limit" -> "HTTP 429 throttle · switch to Gentle or wait before retrying"
+    "rate_limit" -> "HTTP 429 throttle · switch to Slow (Safe) or wait before retrying"
     "timeout" -> "Site took too long to respond · safe to retry"
     "unreachable" -> "Site offline or did not return API JSON"
-    "captcha" -> "Interactive challenge required on site"
+    "captcha" -> "Merchant requires AliyunCaptcha once · tap Solve Captcha to save session"
     "invalid_login" -> "No matching account for your configured phone/password"
     else -> "Unexpected sign-in error"
 }

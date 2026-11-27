@@ -9,14 +9,14 @@ import kotlinx.coroutines.sync.withLock
 
 /**
  * Adaptive coroutine concurrency limiter (AIMD-style) with live active and peak worker telemetry.
- * Configured per FetchSpeedPreset (default Safe: 1..3 workers, starting at 2).
+ * Configured per FetchSpeedPreset (default Medium: 4..6 workers).
  * Scales up cautiously (+1 after 10 consecutive healthy domains) and steps down immediately
  * on firewall/rate-limit/timeout congestion.
  */
 class AdaptiveConcurrencyController(
-    private var minLimit: Int = 1,
-    initialLimit: Int = 2,
-    private var maxLimit: Int = 3
+    private var minLimit: Int = 4,
+    initialLimit: Int = 4,
+    private var maxLimit: Int = 6
 ) {
     private val mutex = Mutex()
     private var inFlight: Int = 0
@@ -90,14 +90,41 @@ class AdaptiveConcurrencyController(
         }
     }
 
-    suspend fun reset(min: Int = 1, initial: Int = 2, max: Int = 3) {
+    suspend fun stepDownToMin() {
+        mutex.withLock {
+            consecutiveHealthy = 0
+            targetLimit = minLimit
+            _currentLimit.value = targetLimit
+        }
+    }
+
+    /**
+     * Temporarily steps concurrency down to at most 2 workers after a real HTTP 429/WAF cooldown
+     * so Fast (Caution) and Medium (Default) presets resume gently before scaling back up.
+     */
+    suspend fun stepDownForCooldown() {
+        mutex.withLock {
+            consecutiveHealthy = 0
+            targetLimit = minLimit.coerceAtMost(2).coerceAtLeast(1)
+            _currentLimit.value = targetLimit
+        }
+    }
+
+    suspend fun reset(
+        min: Int = 6,
+        initial: Int = 6,
+        max: Int = 8,
+        preservePeak: Boolean = false
+    ) {
         mutex.withLock {
             minLimit = min.coerceAtLeast(1)
             maxLimit = max.coerceAtLeast(minLimit)
             targetLimit = initial.coerceIn(minLimit, maxLimit)
             consecutiveHealthy = 0
-            peakObserved = 0
-            _peakWorkers.value = 0
+            if (!preservePeak) {
+                peakObserved = 0
+                _peakWorkers.value = 0
+            }
             _currentLimit.value = targetLimit
         }
     }

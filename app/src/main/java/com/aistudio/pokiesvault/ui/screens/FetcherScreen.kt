@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.Button
@@ -55,7 +56,11 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aistudio.pokiesvault.R
-import com.aistudio.pokiesvault.ui.components.AccountResultCard
+import com.aistudio.pokiesvault.data.model.BonusMode
+import com.aistudio.pokiesvault.data.model.SortMode
+import com.aistudio.pokiesvault.ui.components.BackgroundBatteryHintBanner
+import com.aistudio.pokiesvault.ui.components.CaptchaSignInDialog
+import com.aistudio.pokiesvault.ui.components.DomainWalletCard
 import com.aistudio.pokiesvault.ui.components.EmptyStateCard
 import com.aistudio.pokiesvault.ui.components.GroupedRejectedSection
 import com.aistudio.pokiesvault.ui.components.LiveFetchStatsCard
@@ -76,6 +81,7 @@ fun FetcherScreen(
 ) {
     val state by viewModel.fetcherState.collectAsStateWithLifecycle()
     val egressState by viewModel.egressState.collectAsStateWithLifecycle()
+    val captchaSignInDomain by viewModel.captchaSignInDomain.collectAsStateWithLifecycle()
     val palette = LocalVaultPalette.current
 
     var showPassword by remember { mutableStateOf(false) }
@@ -149,6 +155,17 @@ fun FetcherScreen(
                 Spacer(modifier = Modifier.height(12.dp))
             }
 
+            // Battery optimization shortcut when Background Runs is ON
+            if (state.allowBackgroundRuns) {
+                item(key = "fetcher_bg_battery_hint") {
+                    BackgroundBatteryHintBanner(
+                        allowBackgroundRuns = state.allowBackgroundRuns,
+                        tagPrefix = "fetcher_"
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+            }
+
             // Actionable WAF Auto-Pause or Saved Checkpoint Banner
             val checkpoint = state.activeCheckpoint
             if (checkpoint != null && !state.isFetching) {
@@ -199,7 +216,7 @@ fun FetcherScreen(
 
                         Spacer(modifier = Modifier.height(10.dp))
 
-                        // Selectable Speed Preset (Gentle / Safe / Balanced)
+                        // Selectable Speed Preset (Slow (Safe) / Medium (Default) / Fast (Caution))
                         SpeedPresetSelector(
                             selected = state.speedPreset,
                             enabled = !state.isFetching,
@@ -507,21 +524,85 @@ fun FetcherScreen(
                 }
             }
 
+            // Shared Sort / Filter Status Bar for Fetcher Results
+            item(key = "fetcher_sort_filter_bar") {
+                Spacer(modifier = Modifier.height(14.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.surface,
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Order: ${state.sortMode.label}",
+                                color = MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            val filterMeta = buildList {
+                                if (state.bonusMode != BonusMode.NONE) {
+                                    add("${state.bonusMode.emoji} ${state.bonusMode.label}")
+                                }
+                                if (state.notVisitedFilter) add("Not visited")
+                                if (state.signupOnlyFilter) add("Signup only")
+                                if (state.mineOnlyFilter) add("Bookmarked")
+                            }.joinToString(" · ")
+                            if (filterMeta.isNotBlank()) {
+                                Text(
+                                    text = filterMeta,
+                                    color = palette.accentA,
+                                    style = MonoTextStyles.metricSmall
+                                )
+                            }
+                        }
+                        OutlinedButton(
+                            onClick = { viewModel.setSortFilterOpen(true) },
+                            border = BorderStroke(
+                                1.dp,
+                                if (state.sortMode != SortMode.DEFAULT || state.bonusMode != BonusMode.NONE) {
+                                    palette.accentA
+                                } else {
+                                    MaterialTheme.colorScheme.outline
+                                }
+                            ),
+                            modifier = Modifier.testTag("fetcher_sort_filter_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Tune,
+                                contentDescription = "Open Sort and Filter",
+                                tint = palette.accentA,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("⇅ Sort / Filter", color = palette.accentA)
+                        }
+                    }
+                }
+            }
+
             // Section 1: Accounts with balance or bonuses
             item(key = "section_valid_header") {
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(14.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "ACCOUNTS WITH VALUE · ${state.validAccounts.size}",
+                        text = "ACCOUNTS WITH VALUE · ${state.validItems.size}",
                         color = palette.accentA,
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.ExtraBold
                     )
-                    if (state.validAccounts.isNotEmpty()) {
+                    if (state.validItems.isNotEmpty()) {
                         Text(
                             text = FormatUtil.money(state.totalCash),
                             color = palette.live,
@@ -529,37 +610,63 @@ fun FetcherScreen(
                         )
                     }
                 }
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
             }
 
-            if (state.validAccounts.isEmpty()) {
+            if (state.validItems.isEmpty()) {
                 item(key = "empty_valid") {
                     EmptyStateCard(
                         icon = Icons.Default.Bolt,
-                        title = "No balances or bonuses loaded yet",
-                        subtitle = "Enter your credentials above and tap Fetch to inspect wallets concurrently."
+                        title = "No matching balances or bonuses",
+                        subtitle = if (state.rawSignedInCount > 0) {
+                            "Adjust your active Sort / Filter options above to see hidden signed-in accounts."
+                        } else {
+                            "Enter your credentials above and tap Fetch to inspect wallets safely."
+                        }
                     )
                 }
             } else {
-                items(items = state.validAccounts, key = { "ok_${it.domain}" }) { row ->
-                    AccountResultCard(row = row)
+                items(items = state.validItems, key = { "ok_${it.site.domain}" }) { item ->
+                    DomainWalletCard(
+                        item = item,
+                        walletMode = true,
+                        bonusMode = state.bonusMode,
+                        cardColor = state.cardColor,
+                        sortMode = state.sortMode,
+                        compact = false,
+                        onCardClick = { viewModel.markVisited(item.site.domain) },
+                        onDetailClick = { viewModel.openSiteDetail(item.site.domain) },
+                        onBookmarkToggle = { viewModel.toggleMine(item.site.domain) },
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
                 }
             }
 
             // Section 2: Signed in, zero waiting
-            if (state.emptyAccounts.isNotEmpty()) {
+            if (state.emptyItems.isNotEmpty()) {
                 item(key = "section_empty_header") {
                     Spacer(modifier = Modifier.height(14.dp))
                     Text(
-                        text = "SIGNED IN · NOTHING WAITING (${state.emptyAccounts.size})",
+                        text = "SIGNED IN · NOTHING WAITING (${state.emptyItems.size})",
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold
                     )
-                    Spacer(modifier = Modifier.height(6.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
-                items(items = state.emptyAccounts, key = { "empty_${it.domain}" }) { row ->
-                    AccountResultCard(row = row)
+                items(items = state.emptyItems, key = { "empty_${it.site.domain}" }) { item ->
+                    DomainWalletCard(
+                        item = item,
+                        walletMode = true,
+                        bonusMode = state.bonusMode,
+                        cardColor = state.cardColor,
+                        sortMode = state.sortMode,
+                        compact = false,
+                        onCardClick = { viewModel.markVisited(item.site.domain) },
+                        onDetailClick = { viewModel.openSiteDetail(item.site.domain) },
+                        onBookmarkToggle = { viewModel.toggleMine(item.site.domain) },
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
                 }
             }
 
@@ -573,7 +680,8 @@ fun FetcherScreen(
                         retryableCount = state.retryableDomains.size,
                         isFetching = state.isFetching,
                         onRetryCode = { code -> viewModel.retryRejectedCode(code) },
-                        onRetryAllRecoverable = { viewModel.retryFailedFetches() }
+                        onRetryAllRecoverable = { viewModel.retryFailedFetches() },
+                        onSolveCaptcha = { domain -> viewModel.openCaptchaSignIn(domain) }
                     )
                 }
             }
@@ -582,5 +690,24 @@ fun FetcherScreen(
                 ResponsibleGamblingFooter()
             }
         }
+    }
+
+    val activeCaptchaDomain = captchaSignInDomain
+    if (activeCaptchaDomain != null) {
+        CaptchaSignInDialog(
+            domain = activeCaptchaDomain,
+            savedPhone = state.credentials.phone,
+            savedPassword = state.credentials.password,
+            onDismiss = { viewModel.dismissCaptchaSignIn() },
+            onSessionCaptured = { accessId, accessToken, host, merchantId ->
+                viewModel.completeCaptchaSignIn(
+                    domain = activeCaptchaDomain,
+                    accessId = accessId,
+                    accessToken = accessToken,
+                    host = host,
+                    merchantId = merchantId
+                )
+            }
+        )
     }
 }

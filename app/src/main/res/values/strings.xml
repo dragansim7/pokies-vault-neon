@@ -20,4 +20,15 @@
     <string name="domain_intel_subtitle">Unified domain registry across Directory, Fetcher, and Bonus Finder with live latency telemetry.</string>
     <string name="gamble_responsibly">18+ Gamble responsibly. Need help? Gambling Help Online — 1800 858 858 · BetStop</string>
     <string name="vault_disclaimer">Pokies Vault checks sites you already use. It does not take bets, sell fetches, or rent listings. Passwords stay encrypted on this device.</string>
+    <string name="bg_runs_toggle_cd">Toggle background runs when app is closed</string>
+    <string name="bg_runs_on_label">BG ON</string>
+    <string name="bg_runs_off_label">BG OFF</string>
+    <string name="bg_service_channel_name">Background Scans</string>
+    <string name="bg_service_channel_desc">Live progress for Account Fetcher and Bonus Finder background runs</string>
+    <string name="bg_service_stop_action">Stop</string>
+    <string name="add_latest_list">Add Latest List</string>
+    <string name="adding_latest_list">Fetching latest list…</string>
+    <string name="bg_battery_hint_title">Battery saver may pause background scans</string>
+    <string name="bg_battery_hint_action">Unrestricted</string>
+    <string name="bg_battery_hint_cd">Open Android battery settings for Pokies Vault</string>
 </resources>

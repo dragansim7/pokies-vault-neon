@@ -6,6 +6,7 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import com.aistudio.pokiesvault.data.model.CardColor
 import com.aistudio.pokiesvault.data.model.VaultThemeId
 
 @Immutable
@@ -150,3 +151,24 @@ object VaultThemes {
 }
 
 val LocalVaultPalette = staticCompositionLocalOf { VaultThemes.Vault }
+
+object VaultCardColors {
+    val GoldAccent = Color(0xFFF0B429)
+    val GoldWarmSurface = Color(0xFF1F190D)
+    val GoldPillSurface = Color(0xFF332812)
+    val ObsidianRowBg = Color(0xFF07070A)
+
+    fun glowColorFor(cardColor: CardColor): Color? = when (cardColor) {
+        CardColor.CLASSIC -> null
+        CardColor.PINK -> Color(0xFFFF4FD8)
+        CardColor.BLUE -> Color(0xFF3AA0FF)
+        CardColor.PURPLE -> Color(0xFFA855F7)
+        CardColor.GREEN -> Color(0xFF3DDC97)
+        CardColor.TEAL -> Color(0xFF2EE6D6)
+        CardColor.YELLOW -> Color(0xFFFFE14A)
+        CardColor.GOLD -> Color(0xFFF0B429)
+        CardColor.ORANGE -> Color(0xFFFF8A2A)
+        CardColor.RED -> Color(0xFFFF4D6A)
+        CardColor.WHITE -> Color(0xFFE8EEFF)
+    }
+}

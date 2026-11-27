@@ -1,5 +1,6 @@
 export type BonusSlot = "deposit" | "signup" | "share" | "daily" | "birthday";
 export type BonusKind = "fixed" | "percent" | "random" | "unset";
+export type BonusSortMetric = "" | "az" | "za" | "deposit" | "amount" | "withdraw" | "turnover" | "count";
 
 export type PublicBonus = {
   id: string;
@@ -29,10 +30,10 @@ export type CatalogueQuery = {
   merchantId?: string;
 };
 
-const SLOTS: BonusSlot[] = ["deposit", "signup", "share", "daily", "birthday"];
+export const CORE_SLOTS: BonusSlot[] = ["deposit", "signup", "share", "daily", "birthday"];
 
 export function isSlot(value: string): value is BonusSlot {
-  return SLOTS.includes(value as BonusSlot);
+  return CORE_SLOTS.includes(value as BonusSlot);
 }
 
 function num(value: unknown): number | null {
@@ -152,14 +153,122 @@ function rank(bonus: PublicBonus): number {
   return 0;
 }
 
+export function bonusMetricValue(bonus: PublicBonus | null, metric: BonusSortMetric): number | null {
+  if (!bonus || bonus.kind === "unset") return null;
+  if (metric === "deposit") {
+    return bonus.slot === "deposit" && bonus.kind === "percent" && bonus.amount > 0 ? bonus.amount : null;
+  }
+  if (metric === "withdraw") {
+    return bonus.maxWithdraw != null && bonus.maxWithdraw > 0 ? bonus.maxWithdraw : null;
+  }
+  if (metric === "turnover") {
+    if (bonus.rollover != null && bonus.rollover > 0) return bonus.rollover;
+    if (bonus.kind !== "percent" && bonus.amount > 0 && bonus.minWithdraw != null && bonus.minWithdraw > 0) {
+      return bonus.minWithdraw / bonus.amount;
+    }
+    return null;
+  }
+  if (metric === "amount") {
+    return bonus.amount > 0 ? bonus.amount : null;
+  }
+  return null;
+}
+
 export function bestBonus(bonuses: PublicBonus[], slot: BonusSlot): PublicBonus | null {
   const matches = bonuses.filter((bonus) => bonus.slot === slot);
   if (!matches.length) return null;
-  return [...matches].sort((a, b) => {
-    if (slot === "deposit") {
-      const match = (bonus: PublicBonus) => (bonus.kind === "percent" ? bonus.amount : -1);
-      return match(b) - match(a);
+  return (
+    [...matches].sort((a, b) => {
+      if (slot === "deposit") {
+        const match = (bonus: PublicBonus) => (bonus.kind === "percent" ? bonus.amount : -1);
+        return match(b) - match(a) || rank(b) - rank(a);
+      }
+      return rank(b) - rank(a);
+    })[0] ?? null
+  );
+}
+
+/**
+ * Picks the representative bonus for a slot in a way that stays synchronized
+ * with the active sort metric so the displayed tile value always matches
+ * the value used to rank the card.
+ */
+export function bestBonusForMetric(
+  bonuses: PublicBonus[],
+  slot: BonusSlot,
+  metric: BonusSortMetric = "",
+): PublicBonus | null {
+  const matches = bonuses.filter((bonus) => bonus.slot === slot && bonus.kind !== "unset");
+  if (!matches.length) return bestBonus(bonuses, slot);
+  if (metric === "turnover") {
+    return (
+      [...matches].sort((a, b) => {
+        const va = bonusMetricValue(a, "turnover");
+        const vb = bonusMetricValue(b, "turnover");
+        if (va == null && vb == null) return rank(b) - rank(a);
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        return va - vb || rank(b) - rank(a);
+      })[0] ?? null
+    );
+  }
+  if (metric === "withdraw") {
+    return (
+      [...matches].sort((a, b) => {
+        const va = bonusMetricValue(a, "withdraw");
+        const vb = bonusMetricValue(b, "withdraw");
+        if (va == null && vb == null) return rank(b) - rank(a);
+        if (va == null) return 1;
+        if (vb == null) return -1;
+        return vb - va || rank(b) - rank(a);
+      })[0] ?? null
+    );
+  }
+  return bestBonus(matches, slot);
+}
+
+/**
+ * Computes the winning bonus and metric value for a domain given the active
+ * filter slots, optional focus slot, and sort metric.
+ */
+export function domainBonusMetric(
+  bonuses: PublicBonus[],
+  activeSlots: BonusSlot[],
+  focusSlot: BonusSlot | "",
+  metric: BonusSortMetric,
+): { bonus: PublicBonus | null; value: number | null; slot: BonusSlot | null } {
+  if (!bonuses.length) return { bonus: null, value: null, slot: null };
+  if (metric === "count") {
+    const scope = activeSlots.length
+      ? bonuses.filter((bonus) => bonus.slot !== "other" && activeSlots.includes(bonus.slot) && bonus.kind !== "unset")
+      : bonuses.filter((bonus) => bonus.kind !== "unset");
+    return { bonus: scope[0] ?? null, value: scope.length, slot: focusSlot || activeSlots[0] || null };
+  }
+  if (metric === "deposit") {
+    const picked = bestBonusForMetric(bonuses, "deposit", "deposit");
+    return { bonus: picked, value: bonusMetricValue(picked, "deposit"), slot: "deposit" };
+  }
+  const candidateSlots: BonusSlot[] = focusSlot
+    ? [focusSlot]
+    : activeSlots.length
+      ? activeSlots
+      : CORE_SLOTS;
+  const ascending = metric === "turnover";
+  let winner: { bonus: PublicBonus | null; value: number | null; slot: BonusSlot | null } = {
+    bonus: null,
+    value: null,
+    slot: null,
+  };
+  for (const slot of candidateSlots) {
+    const picked = bestBonusForMetric(bonuses, slot, metric);
+    const val = bonusMetricValue(picked, metric);
+    if (val == null) continue;
+    if (
+      winner.value == null ||
+      (ascending ? val < winner.value : val > winner.value)
+    ) {
+      winner = { bonus: picked, value: val, slot };
     }
-    return rank(b) - rank(a);
-  })[0] ?? null;
+  }
+  return winner;
 }

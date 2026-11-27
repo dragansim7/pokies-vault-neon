@@ -7,10 +7,12 @@ import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusKind
 import com.aistudio.pokiesvault.data.model.PublicBonusSlot
+import com.aistudio.pokiesvault.data.model.SavedDomainSession
 import com.aistudio.pokiesvault.data.model.SiteStatus
 import com.aistudio.pokiesvault.data.model.WalletView
 import com.aistudio.pokiesvault.util.DomainUtil
 import com.aistudio.pokiesvault.util.FormatUtil
+import com.aistudio.pokiesvault.util.SiteOrderUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -23,8 +25,12 @@ import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import kotlin.math.pow
@@ -42,32 +48,56 @@ data class PublicCatalogueResult(
     val bonuses: List<PublicBonus>,
     val message: String? = null,
     val host: String? = null,
-    val merchantId: String? = null
+    val merchantId: String? = null,
+    val latencyMs: Long = 0L,
+    val retriesUsed: Int = 0,
+    val attemptsUsed: Int = 1,
+    val errorCode: String? = null,
+    val congested: Boolean = false,
+    val wafSignal: Boolean = false,
+    val retryAfterSec: Long? = null
 )
 
 data class AccountFetchOutcome(
     val result: AccountResult,
     val discoveredTarget: HostTarget? = null,
     val congested: Boolean = false,
-    val wafSignal: Boolean = false
+    val wafSignal: Boolean = false,
+    val retryAfterSec: Long? = null,
+    val newSession: SavedDomainSession? = null,
+    val sessionExpired: Boolean = false,
+    val reusedSession: Boolean = false
+)
+
+data class DnsClusterResult(
+    val cluster: String,
+    val isDeadDns: Boolean = false
 )
 
 class CasinoApiService {
-    private val sharedPool = ConnectionPool(16, 2, TimeUnit.MINUTES)
+    private val sharedPool = ConnectionPool(32, 2, TimeUnit.MINUTES)
     private val sharedDispatcher = Dispatcher().apply {
-        maxRequests = 40
-        maxRequestsPerHost = 8
+        maxRequests = 96
+        maxRequestsPerHost = 12
     }
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectionPool(sharedPool)
         .dispatcher(sharedDispatcher)
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .writeTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(13, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
         .followRedirects(true)
         .retryOnConnectionFailure(true)
         .build()
+
+    private data class CachedDnsEntry(
+        val result: DnsClusterResult,
+        val resolvedAtMs: Long
+    )
+
+    private val originClusterCache = ConcurrentHashMap<String, CachedDnsEntry>()
+    private val dnsCacheTtlMs = 30L * 60L * 1000L
 
     private val probeClient: OkHttpClient = OkHttpClient.Builder()
         .connectionPool(sharedPool)
@@ -266,46 +296,345 @@ class CasinoApiService {
     }
 
     /**
-     * Streams homepage HTML only until MERCHANTID is matched (max 1.2MB) to minimize bandwidth and latency.
+     * Fetches the latest domain list JSON from https://intel.bestpokieslist.online/domains
+     * and extracts each entry's "domain" string (ignoring status and all other fields).
      */
-    suspend fun discoverHostTarget(domain: String): HostTarget? = withContext(Dispatchers.IO) {
+    suspend fun fetchLatestDomainsList(): Result<List<String>> = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
-                .url("https://$domain/")
+                .url("https://intel.bestpokieslist.online/domains")
+                .header("Accept", "application/json")
                 .header("User-Agent", userAgent)
-                .header("Accept", "text/html")
                 .get()
                 .build()
 
             client.newCall(request).execute().use { response ->
-                val finalHost = DomainUtil.normalizeDomain(response.request.url.host)
-                val resolvedHost = if (DomainUtil.isPublicDomain(finalHost)) finalHost else domain
-                val source = response.body?.charStream() ?: return@withContext null
-                val buffer = CharArray(8192)
-                val sb = StringBuilder(16384)
-                var merchantId = ""
+                if (!response.isSuccessful) {
+                    return@withContext Result.failure(
+                        IOException("Server returned HTTP ${response.code}")
+                    )
+                }
+                val body = response.body?.string()?.trim()
+                if (body.isNullOrEmpty()) {
+                    return@withContext Result.failure(IOException("Empty response from server"))
+                }
+                val root = try {
+                    JSONObject(body)
+                } catch (_: Exception) {
+                    return@withContext Result.failure(IllegalStateException("Invalid JSON response"))
+                }
+                val array = root.optJSONArray("domains")
+                    ?: return@withContext Result.failure(
+                        IllegalStateException("Response missing domains list")
+                    )
 
-                while (sb.length < 1_200_000) {
-                    val read = source.read(buffer)
-                    if (read <= 0) break
-                    sb.append(buffer, 0, read)
-                    val matcher = merchantIdPattern.matcher(sb)
-                    if (matcher.find()) {
-                        merchantId = matcher.group(1) ?: ""
-                        break
+                val extracted = LinkedHashSet<String>(array.length())
+                for (i in 0 until array.length()) {
+                    val item = array.optJSONObject(i) ?: continue
+                    val rawDomain = item.optString("domain", "").trim()
+                    if (rawDomain.isNotEmpty()) {
+                        extracted.add(rawDomain)
                     }
                 }
-                if (merchantId.isNotEmpty()) {
-                    HostTarget(domain = domain, host = resolvedHost, merchantId = merchantId)
-                } else {
-                    null
+
+                if (extracted.isEmpty()) {
+                    return@withContext Result.failure(
+                        IllegalStateException("Latest list returned no domains")
+                    )
                 }
+                Result.success(extracted.toList())
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: SocketTimeoutException) {
+            Result.failure(IOException("Request timed out"))
+        } catch (e: IOException) {
+            Result.failure(IOException(e.message?.takeIf { it.isNotBlank() } ?: "Network error"))
+        } catch (e: Exception) {
+            Result.failure(IllegalStateException(e.message?.takeIf { it.isNotBlank() } ?: "Unexpected error"))
+        }
+    }
+
+    /**
+     * Streams homepage HTML only until MERCHANTID is matched (max 1.2MB) using linear
+     * sliding-window scanning to avoid quadratic regex scans. Surfaces HTTP 429/403/WAF
+     * challenges so callers never silently swallow rate limits.
+     */
+    suspend fun discoverHostTargetChecked(domain: String): HostTarget? = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("https://$domain/")
+            .header("User-Agent", userAgent)
+            .header("Accept", "text/html")
+            .get()
+            .build()
+
+        client.newCall(request).execute().use { response ->
+            val code = response.code
+            if (code == 429) {
+                val retryAfter = response.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1L, 120L)
+                throw RateLimitException("Rate limited (429)", retryAfter)
+            }
+            if (code == 401 || code == 403) {
+                throw BlockedException("Blocked by firewall ($code)")
+            }
+            val finalHost = DomainUtil.normalizeDomain(response.request.url.host)
+            val resolvedHost = if (DomainUtil.isPublicDomain(finalHost)) finalHost else domain
+            val source = response.body?.charStream() ?: return@withContext null
+            val buffer = CharArray(8192)
+            var tail = ""
+            var totalRead = 0
+            var inspectedHeader = false
+            var merchantId = ""
+
+            while (totalRead < 1_200_000) {
+                val read = source.read(buffer)
+                if (read <= 0) break
+                totalRead += read
+                val chunk = String(buffer, 0, read)
+                val window = if (tail.isEmpty()) chunk else tail + chunk
+                if (!inspectedHeader) {
+                    inspectedHeader = true
+                    if (isWafChallengeBody(window)) {
+                        throw BlockedException("Blocked by firewall (WAF challenge)")
+                    }
+                }
+                val matcher = merchantIdPattern.matcher(window)
+                if (matcher.find()) {
+                    merchantId = matcher.group(1) ?: ""
+                    break
+                }
+                tail = if (window.length > 64) window.substring(window.length - 64) else window
+            }
+            if (merchantId.isNotEmpty()) {
+                HostTarget(domain = domain, host = resolvedHost, merchantId = merchantId)
+            } else {
+                null
+            }
+        }
+    }
+
+    /**
+     * Streams homepage HTML only until MERCHANTID is matched (max 1.2MB) to minimize bandwidth and latency.
+     */
+    suspend fun discoverHostTarget(domain: String): HostTarget? = withContext(Dispatchers.IO) {
+        try {
+            discoverHostTargetChecked(domain)
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Resolves and caches the DNS origin cluster for a domain (30 min TTL) so shared backend
+     * IP pools (e.g., 800 sites on 43.106.19.168) are interleaved and spaced accurately, while
+     * NXDOMAIN / dead-DNS domains are flagged for immediate fast-skip.
+     */
+    suspend fun resolveOriginClusterDetailed(rawDomain: String): DnsClusterResult = withContext(Dispatchers.IO) {
+        val domain = DomainUtil.normalizeDomain(rawDomain)
+        if (!DomainUtil.isPublicDomain(domain)) {
+            return@withContext DnsClusterResult("host:$domain", isDeadDns = false)
+        }
+        val now = System.currentTimeMillis()
+        originClusterCache[domain]?.let { cached ->
+            if ((now - cached.resolvedAtMs) < dnsCacheTtlMs) {
+                return@withContext cached.result
+            }
+        }
+        val resolved = try {
+            val addresses = InetAddress.getAllByName(domain)
+            val ipv4s = addresses
+                .filterIsInstance<Inet4Address>()
+                .mapNotNull { it.hostAddress }
+                .sorted()
+            val primary = ipv4s.firstOrNull()
+            when {
+                primary == null -> DnsClusterResult("host:$domain", isDeadDns = false)
+                isCloudflareIpv4(primary) -> DnsClusterResult("cf:$domain", isDeadDns = false)
+                else -> DnsClusterResult("ip:$primary", isDeadDns = false)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: UnknownHostException) {
+            DnsClusterResult("dead:$domain", isDeadDns = true)
+        } catch (_: Exception) {
+            DnsClusterResult("host:$domain", isDeadDns = false)
+        }
+        originClusterCache[domain] = CachedDnsEntry(resolved, now)
+        resolved
+    }
+
+    suspend fun resolveOriginCluster(rawDomain: String): String =
+        resolveOriginClusterDetailed(rawDomain).cluster
+
+    private fun isCloudflareIpv4(ip: String): Boolean {
+        val parts = ip.split('.')
+        if (parts.size != 4) return false
+        val a = parts[0].toIntOrNull() ?: return false
+        val b = parts[1].toIntOrNull() ?: return false
+        return (a == 104 && b in 16..31) ||
+            (a == 172 && b in 64..71) ||
+            (a == 188 && b == 114) ||
+            (a == 162 && b == 159) ||
+            (a == 173 && b == 245) ||
+            (a == 198 && b == 41)
+    }
+
+    /**
+     * Fast-path account sync using a saved (accessId, accessToken) session without calling /users/login.
+     * Works for both normal accounts and captcha-gated accounts after a one-time in-app sign-in.
+     */
+    suspend fun syncAccountWithSession(
+        rawDomain: String,
+        accessId: String,
+        accessToken: String,
+        cachedTarget: HostTarget? = null
+    ): AccountFetchOutcome = withContext(Dispatchers.IO) {
+        val started = System.currentTimeMillis()
+        val domain = DomainUtil.normalizeDomain(rawDomain)
+        if (!DomainUtil.isPublicDomain(domain) || accessId.isBlank() || accessToken.isBlank()) {
+            return@withContext AccountFetchOutcome(
+                result = AccountResult.Err(domain, "other", "Invalid saved session", fetchedAt = started),
+                sessionExpired = true
+            )
+        }
+
+        var host = cachedTarget?.host?.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
+        var merchantId = cachedTarget?.merchantId ?: ""
+        var useSelfHeaders = merchantId.isNotEmpty()
+        var newlyDiscovered: HostTarget? = null
+        var retriesUsed = 0
+        var congested = false
+
+        fun buildSyncFields(mid: String): Map<String, String> = mapOf(
+            "module" to "/users/syncData",
+            "merchantId" to mid,
+            "accessId" to accessId,
+            "accessToken" to accessToken,
+            "walletIsAdmin" to "",
+            "background" to "1"
+        )
+
+        var syncResult = executeWithRetry(
+            maxRetries = 1,
+            onRetry = { retriesUsed++ },
+            onCongestion = { congested = true }
+        ) {
+            postApi(host, buildSyncFields(merchantId), useSelfHeaders)
+        }
+
+        var syncJson = syncResult.getOrElse { ex ->
+            val elapsed = System.currentTimeMillis() - started
+            val err = classifyFailure(domain, ex.message ?: "Balances did not load", elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
+            val retryAfter = (ex as? RateLimitException)?.retryAfterSec
+            return@withContext AccountFetchOutcome(
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf || err.code == "timeout",
+                wafSignal = isWaf,
+                retryAfterSec = retryAfter
+            )
+        }
+
+        if (syncJson.optString("status") != "SUCCESS" && merchantId.isEmpty()) {
+            val firstMsg = (syncJson.optJSONObject("data")?.optString("message")
+                ?: syncJson.optString("message", "")).lowercase(Locale.US)
+            if (firstMsg.contains("merchant") || firstMsg.contains("missing")) {
+                val inspected = discoverHostTarget(domain)
+                if (inspected != null && inspected.merchantId.isNotBlank()) {
+                    newlyDiscovered = inspected
+                    host = inspected.host.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
+                    merchantId = inspected.merchantId
+                    useSelfHeaders = true
+                    syncResult = executeWithRetry(
+                        maxRetries = 1,
+                        onRetry = { retriesUsed++ },
+                        onCongestion = { congested = true }
+                    ) {
+                        postApi(host, buildSyncFields(merchantId), useSelfHeaders)
+                    }
+                    syncJson = syncResult.getOrElse { ex ->
+                        val elapsed = System.currentTimeMillis() - started
+                        val err = classifyFailure(domain, ex.message ?: "Balances did not load", elapsed, retriesUsed)
+                        val isWaf = isWafErrorCode(err.code)
+                        val retryAfter = (ex as? RateLimitException)?.retryAfterSec
+                        return@withContext AccountFetchOutcome(
+                            result = err,
+                            discoveredTarget = newlyDiscovered,
+                            congested = congested || isWaf || err.code == "timeout",
+                            wafSignal = isWaf,
+                            retryAfterSec = retryAfter
+                        )
+                    }
+                }
+            }
+        }
+
+        if (syncJson.optString("status") != "SUCCESS") {
+            val sData = syncJson.optJSONObject("data")
+            val msg = sData?.optString("message")
+                ?: syncJson.optString("message", "Saved session expired")
+            val elapsed = System.currentTimeMillis() - started
+            val err = classifyFailure(domain, msg, elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
+            val expired = !isWaf && (isExpiredSessionMessage(msg) || err.code == "invalid_login" || err.code == "other")
+            return@withContext AccountFetchOutcome(
+                result = err,
+                discoveredTarget = newlyDiscovered,
+                congested = congested || isWaf,
+                wafSignal = isWaf,
+                sessionExpired = expired
+            )
+        }
+
+        val userObj = syncJson.optJSONObject("data") ?: JSONObject()
+        val hasInlineBonuses = userObj.optJSONArray("claimableBonuses") != null ||
+            userObj.optJSONArray("availableBonuses") != null ||
+            userObj.optJSONArray("bonus") != null
+        var fallbackBonuses: JSONArray? = null
+        if (!hasInlineBonuses && merchantId.isNotEmpty()) {
+            try {
+                val pub = postApi(
+                    host,
+                    mapOf(
+                        "module" to "/merchants/getPublicInfo",
+                        "merchantId" to merchantId,
+                        "accessId" to "",
+                        "accessToken" to "",
+                        "walletIsAdmin" to ""
+                    ),
+                    useSelfHeaders = true
+                )
+                fallbackBonuses = pub.optJSONObject("data")?.optJSONArray("promotions")
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Non-fatal fallback
+            }
+        }
+
+        val elapsed = System.currentTimeMillis() - started
+        val parsed = parseSyncUser(domain, userObj, fallbackBonuses, elapsed, retriesUsed)
+        AccountFetchOutcome(
+            result = parsed,
+            discoveredTarget = newlyDiscovered,
+            congested = congested,
+            reusedSession = true
+        )
+    }
+
+    private fun isExpiredSessionMessage(raw: String): Boolean {
+        val l = raw.lowercase(Locale.US)
+        return l.contains("token") ||
+            l.contains("session") ||
+            l.contains("login") ||
+            l.contains("unauthorized") ||
+            l.contains("expired") ||
+            l.contains("access") ||
+            l.contains("auth") ||
+            l.contains("user")
     }
 
     suspend fun fetchCasinoAccount(
@@ -367,11 +696,13 @@ class CasinoApiService {
             val elapsed = System.currentTimeMillis() - started
             val err = classifyFailure(domain, ex.message ?: "Could not reach site", elapsed, retriesUsed)
             val isWaf = isWafErrorCode(err.code)
+            val retryAfter = (ex as? RateLimitException)?.retryAfterSec
             return@withContext AccountFetchOutcome(
                 result = err,
                 discoveredTarget = newlyDiscovered,
                 congested = congested || isWaf || err.code == "timeout",
-                wafSignal = isWaf
+                wafSignal = isWaf,
+                retryAfterSec = retryAfter
             )
         }
 
@@ -404,11 +735,13 @@ class CasinoApiService {
                         val elapsed = System.currentTimeMillis() - started
                         val err = classifyFailure(domain, ex.message ?: "Could not reach site", elapsed, retriesUsed)
                         val isWaf = isWafErrorCode(err.code)
+                        val retryAfter = (ex as? RateLimitException)?.retryAfterSec
                         return@withContext AccountFetchOutcome(
                             result = err,
                             discoveredTarget = newlyDiscovered,
                             congested = congested || isWaf || err.code == "timeout",
-                            wafSignal = isWaf
+                            wafSignal = isWaf,
+                            retryAfterSec = retryAfter
                         )
                     }
                 }
@@ -463,11 +796,13 @@ class CasinoApiService {
             val elapsed = System.currentTimeMillis() - started
             val err = classifyFailure(domain, ex.message ?: "Balances did not load", elapsed, retriesUsed)
             val isWaf = isWafErrorCode(err.code)
+            val retryAfter = (ex as? RateLimitException)?.retryAfterSec
             return@withContext AccountFetchOutcome(
                 result = err,
                 discoveredTarget = newlyDiscovered,
                 congested = congested || isWaf || err.code == "timeout",
-                wafSignal = isWaf
+                wafSignal = isWaf,
+                retryAfterSec = retryAfter
             )
         }
 
@@ -487,8 +822,11 @@ class CasinoApiService {
 
         val userObj = syncJson.optJSONObject("data") ?: JSONObject()
         // If syncData omitted bonus[], try /merchants/getPublicInfo as fallback
+        val hasInlineBonuses = userObj.optJSONArray("claimableBonuses") != null ||
+            userObj.optJSONArray("availableBonuses") != null ||
+            userObj.optJSONArray("bonus") != null
         var fallbackBonuses: JSONArray? = null
-        if (userObj.optJSONArray("bonus") == null && merchantId.isNotEmpty()) {
+        if (!hasInlineBonuses && merchantId.isNotEmpty()) {
             try {
                 val pub = postApi(
                     host,
@@ -511,83 +849,203 @@ class CasinoApiService {
 
         val elapsed = System.currentTimeMillis() - started
         val parsed = parseSyncUser(domain, userObj, fallbackBonuses, elapsed, retriesUsed)
-        AccountFetchOutcome(parsed, newlyDiscovered, congested)
+        val savedSession = SavedDomainSession(
+            domain = domain,
+            host = host,
+            merchantId = merchantId,
+            accessId = accessId,
+            accessToken = accessToken,
+            winningPhone = phone,
+            updatedAt = System.currentTimeMillis()
+        )
+        AccountFetchOutcome(
+            result = parsed,
+            discoveredTarget = newlyDiscovered,
+            congested = congested,
+            newSession = savedSession
+        )
     }
 
     suspend fun fetchPublicBonuses(
         rawDomain: String,
         cachedTarget: HostTarget? = null
     ): PublicCatalogueResult = withContext(Dispatchers.IO) {
+        val started = System.currentTimeMillis()
         val domain = DomainUtil.normalizeDomain(rawDomain)
         if (!DomainUtil.isPublicDomain(domain)) {
-            return@withContext PublicCatalogueResult(domain, false, emptyList(), "Enter a valid domain")
+            return@withContext PublicCatalogueResult(
+                domain = domain,
+                ok = false,
+                bonuses = emptyList(),
+                message = "Enter a valid domain",
+                latencyMs = (System.currentTimeMillis() - started).coerceAtLeast(1L),
+                errorCode = "other"
+            )
         }
 
-        var host = cachedTarget?.host?.takeIf { DomainUtil.isPublicDomain(it) } ?: ""
+        var resolvedHost = cachedTarget?.host?.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
         var merchantId = cachedTarget?.merchantId ?: ""
+        var retriesUsed = 0
+        var attemptsUsed = 0
+        var congested = false
 
-        if (merchantId.isBlank()) {
-            val discovered = discoverHostTarget(domain)
-            if (discovered != null) {
-                host = discovered.host
+        fun buildPublicFields(mid: String): Map<String, String> = mapOf(
+            "module" to "/merchants/getPublicInfo",
+            "merchantId" to mid,
+            "accessId" to "",
+            "accessToken" to "",
+            "walletIsAdmin" to ""
+        )
+
+        // Direct API-first path: call /merchants/getPublicInfo directly (blank merchantId works on
+        // the vast majority of sites, avoiding a 750KB–1.2MB homepage GET and homepage-only 403s).
+        attemptsUsed++
+        var result = executeWithRetry(
+            maxRetries = 1,
+            onRetry = { retriesUsed++ },
+            onCongestion = { congested = true }
+        ) {
+            postApi(resolvedHost, buildPublicFields(merchantId), useSelfHeaders = true)
+        }
+
+        // Lazy homepage discovery fallback ONLY if merchantId was blank and the direct API call
+        // explicitly failed with a missing-merchant response or non-JSON/404 redirect.
+        val needsHtmlDiscovery = merchantId.isBlank() && result.fold(
+            onSuccess = { json ->
+                if (json.optString("status") == "SUCCESS") {
+                    false
+                } else {
+                    val msg = (json.optJSONObject("data")?.optString("message")
+                        ?: json.optString("message", "")).lowercase(Locale.US)
+                    msg.contains("merchant") || msg.contains("missing") || msg.isBlank()
+                }
+            },
+            onFailure = { ex ->
+                ex is BadJsonException
+            }
+        )
+
+        if (needsHtmlDiscovery) {
+            val discovered = try {
+                discoverHostTargetChecked(domain)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: RateLimitException) {
+                val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+                return@withContext PublicCatalogueResult(
+                    domain = domain,
+                    ok = false,
+                    bonuses = emptyList(),
+                    message = "Rate limited (429)",
+                    host = resolvedHost,
+                    latencyMs = elapsed,
+                    retriesUsed = retriesUsed,
+                    attemptsUsed = attemptsUsed + retriesUsed,
+                    errorCode = "rate_limit",
+                    congested = true,
+                    wafSignal = true,
+                    retryAfterSec = e.retryAfterSec
+                )
+            } catch (e: BlockedException) {
+                val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+                return@withContext PublicCatalogueResult(
+                    domain = domain,
+                    ok = false,
+                    bonuses = emptyList(),
+                    message = e.message ?: "Blocked by firewall",
+                    host = resolvedHost,
+                    latencyMs = elapsed,
+                    retriesUsed = retriesUsed,
+                    attemptsUsed = attemptsUsed + retriesUsed,
+                    errorCode = "blocked",
+                    congested = true,
+                    wafSignal = true
+                )
+            } catch (_: Exception) {
+                null
+            }
+
+            if (discovered != null && discovered.merchantId.isNotBlank()) {
+                resolvedHost = discovered.host.takeIf { DomainUtil.isPublicDomain(it) } ?: domain
                 merchantId = discovered.merchantId
+                attemptsUsed++
+                result = executeWithRetry(
+                    maxRetries = 1,
+                    onRetry = { retriesUsed++ },
+                    onCongestion = { congested = true }
+                ) {
+                    postApi(resolvedHost, buildPublicFields(merchantId), useSelfHeaders = true)
+                }
             }
         }
 
-        if (merchantId.isBlank()) {
+        val json = result.getOrElse { ex ->
+            val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+            val err = classifyFailure(domain, ex.message ?: "Could not reach bonus list", elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
+            val retryAfter = (ex as? RateLimitException)?.retryAfterSec
             return@withContext PublicCatalogueResult(
                 domain = domain,
                 ok = false,
                 bonuses = emptyList(),
-                message = "No public bonus list published"
-            )
-        }
-
-        val resolvedHost = host.ifBlank { domain }
-        val result = executeWithRetry(maxRetries = 1) {
-            postApi(
-                resolvedHost,
-                mapOf(
-                    "module" to "/merchants/getPublicInfo",
-                    "merchantId" to merchantId,
-                    "accessId" to "",
-                    "accessToken" to "",
-                    "walletIsAdmin" to ""
-                ),
-                useSelfHeaders = true
-            )
-        }
-
-        val json = result.getOrElse {
-            return@withContext PublicCatalogueResult(
-                domain = domain,
-                ok = false,
-                bonuses = emptyList(),
-                message = "Could not reach bonus list",
+                message = err.message.ifBlank { "Could not reach bonus list" },
                 host = resolvedHost,
-                merchantId = merchantId
+                merchantId = merchantId.ifBlank { null },
+                latencyMs = elapsed,
+                retriesUsed = retriesUsed,
+                attemptsUsed = attemptsUsed + retriesUsed,
+                errorCode = err.code,
+                congested = congested || isWaf || err.code == "timeout",
+                wafSignal = isWaf,
+                retryAfterSec = retryAfter
             )
         }
 
+        val elapsed = (System.currentTimeMillis() - started).coerceAtLeast(1L)
         if (json.optString("status") != "SUCCESS") {
+            val rawMsg = json.optJSONObject("data")?.optString("message")
+                ?: json.optString("message", "Bonus list did not load")
+            val err = classifyFailure(domain, rawMsg, elapsed, retriesUsed)
+            val isWaf = isWafErrorCode(err.code)
             return@withContext PublicCatalogueResult(
                 domain = domain,
                 ok = false,
                 bonuses = emptyList(),
-                message = "Bonus list did not load",
+                message = rawMsg.ifBlank { "Bonus list did not load" },
                 host = resolvedHost,
-                merchantId = merchantId
+                merchantId = merchantId.ifBlank { null },
+                latencyMs = elapsed,
+                retriesUsed = retriesUsed,
+                attemptsUsed = attemptsUsed + retriesUsed,
+                errorCode = err.code,
+                congested = congested || isWaf,
+                wafSignal = isWaf
             )
         }
 
-        val promos = json.optJSONObject("data")?.optJSONArray("promotions")
+        val dataObj = json.optJSONObject("data")
+        if (merchantId.isBlank() && dataObj != null) {
+            val extractedMid = dataObj.optJSONObject("merchant")?.optString("id", "")
+                ?.takeIf { it.isNotBlank() && it != "null" }
+                ?: dataObj.optString("merchantId", "").takeIf { it.isNotBlank() && it != "null" }
+            if (!extractedMid.isNullOrBlank()) {
+                merchantId = extractedMid
+            }
+        }
+
+        val promos = dataObj?.optJSONArray("promotions")
         val bonuses = parsePublicPromotions(promos)
         PublicCatalogueResult(
             domain = domain,
             ok = true,
             bonuses = bonuses,
             host = resolvedHost,
-            merchantId = merchantId
+            merchantId = merchantId.ifBlank { null },
+            latencyMs = elapsed,
+            retriesUsed = retriesUsed,
+            attemptsUsed = attemptsUsed + retriesUsed,
+            congested = congested,
+            wafSignal = false
         )
     }
 
@@ -610,6 +1068,9 @@ class CasinoApiService {
             } catch (e: RateLimitException) {
                 // Immediately signal congestion and stop — never hammer a 429 rate limit
                 onCongestion()
+                return Result.failure(e)
+            } catch (e: UnknownHostException) {
+                // Dead DNS domain — fast-fail immediately without retrying or triggering congestion
                 return Result.failure(e)
             } catch (e: TransientHttpException) {
                 onCongestion()
@@ -661,7 +1122,8 @@ class CasinoApiService {
         client.newCall(reqBuilder.build()).execute().use { res ->
             val code = res.code
             if (code == 429) {
-                throw RateLimitException("Rate limited (429)")
+                val retryAfter = res.header("Retry-After")?.trim()?.toLongOrNull()?.coerceIn(1L, 120L)
+                throw RateLimitException("Rate limited (429)", retryAfter)
             }
             if (code == 401 || code == 403) {
                 throw BlockedException("Blocked by firewall ($code)")
@@ -699,7 +1161,7 @@ class CasinoApiService {
     }
 
     private fun isWafErrorCode(code: String): Boolean =
-        code == "blocked" || code == "rate_limit" || code == "captcha"
+        code == "blocked" || code == "rate_limit"
 
     private fun classifyFailure(
         domain: String,
@@ -713,12 +1175,15 @@ class CasinoApiService {
             lower.contains("invalid login") || lower.contains("invalid password") ->
                 AccountResult.Err(domain, "invalid_login", "Not your account", latencyMs, retriesUsed, now)
             lower.contains("captcha") ->
-                AccountResult.Err(domain, "captcha", "Site asked for a captcha", latencyMs, retriesUsed, now)
+                AccountResult.Err(domain, "captcha", "Site requires one-time captcha sign-in", latencyMs, retriesUsed, now)
             lower.contains("429") || lower.contains("rate limit") || lower.contains("too many") ->
                 AccountResult.Err(domain, "rate_limit", "Rate limited (429)", latencyMs, retriesUsed, now)
             lower.contains("blocked") || lower.contains("waf") || lower.contains("cloudflare") ||
                 lower.contains("403") || lower.contains("401") || lower.contains("forbidden") ->
                 AccountResult.Err(domain, "blocked", "Blocked by firewall", latencyMs, retriesUsed, now)
+            lower.contains("unable to resolve host") || lower.contains("unknown host") ||
+                lower.contains("no address associated") ->
+                AccountResult.Err(domain, "unreachable", "Site offline (DNS)", latencyMs, retriesUsed, now)
             lower.contains("bad-json") || lower.contains("empty-") ->
                 AccountResult.Err(domain, "unreachable", "No account JSON returned", latencyMs, retriesUsed, now)
             lower.contains("timeout") || lower.contains("timed out") ->
@@ -757,7 +1222,6 @@ class CasinoApiService {
         val minWithdraw = optPositiveDouble(user, "minWithdraw")
         val maxWithdraw = optPositiveDouble(user, "maxWithdraw")
 
-        val taken = user.optJSONObject("timebonus") ?: JSONObject()
         val commissionList = mutableListOf<BonusView>()
         val shareList = mutableListOf<BonusView>()
         val referralList = mutableListOf<BonusView>()
@@ -765,72 +1229,125 @@ class CasinoApiService {
         val rebateList = mutableListOf<BonusView>()
         val availableBonuses = mutableListOf<BonusView>()
 
-        val bonusArr = user.optJSONArray("bonus") ?: fallbackBonuses ?: JSONArray()
+        val accountPackets = user.optJSONArray("bonus")
+            ?: user.optJSONArray("claimableBonuses")
+            ?: user.optJSONArray("availableBonuses")
+        val accountBound = accountPackets != null
+        val bonusArr = accountPackets ?: fallbackBonuses ?: JSONArray()
+
+        val seen = HashSet<String>(bonusArr.length())
+        val nowMs = System.currentTimeMillis()
+
         for (i in 0 until bonusArr.length()) {
             val b = bonusArr.optJSONObject(i) ?: continue
-            val id = b.optString("id", "")
-            val maxRound = b.optInt("maxRound", 0)
-            val used = taken.optInt(id, 0)
-            if (maxRound > 0 && used >= maxRound) continue
+            val packetId = optLongId(b, "id")
+            val transactionId = optLongId(b, "transactionId")
+            val angpaoId = optLongId(b, "angpaoId")
+            val luckyId = optLongId(b, "luckyId")
+
+            val rawHeading = b.optString("name", "")
+                .ifBlank { b.optString("title", "") }
+                .ifBlank { b.optString("description", "") }
+            val name = cleanName(rawHeading).ifBlank { "Bonus" }
+
+            val dedupeKey = if (packetId != 0L || transactionId != 0L || angpaoId != 0L || luckyId != 0L) {
+                "$packetId:$transactionId:$angpaoId:$luckyId"
+            } else {
+                "idx:$i:${name.lowercase(Locale.US)}"
+            }
+            if (!seen.add(dedupeKey)) continue
 
             val claimConfig = parseJsonObj(b.opt("claimConfig"))
-            val creditLessThan = claimConfig.optDouble("creditLessThan", -1.0)
-            if (creditLessThan > 0.0 && cash >= creditLessThan) continue
+            val txType = b.optString("transactionType", "").uppercase(Locale.US)
+            if (!isVisiblePacket(b, claimConfig, txType, name)) continue
 
-            val name = cleanName(b.optString("name", "Bonus")).ifBlank { "Bonus" }
-            val custom = claimConfig.optString("customBonus", "")
-            val fixed = b.optDouble("bonusFixed", 0.0).takeIf { it.isFinite() } ?: 0.0
-            val percent = b.optDouble("bonus", 0.0).takeIf { it.isFinite() } ?: 0.0
+            // Authoritative per-account eligibility check matching vefrop app.js & parse-account.ts:
+            // Only packets from the signed-in user's bonus[] array that carry an explicit `amount`
+            // (including 0 / "0" for mystery/random bonuses like DAILY FREE) and are inside their
+            // active start/end window are lit/claimable right now.
+            val lit = accountBound && holdsAmount(b.opt("amount")) && isWithinWindow(b, nowMs)
+
+            val displayAmountFlag = optIntOrNull(b, "displayAmount")
+            val liveAmount = optFiniteDouble(b, "amount") ?: 0.0
             val randomObj = parseJsonObj(b.opt("bonusRandom"))
-            val rmin = randomObj.optDouble("min", 0.0).takeIf { it.isFinite() } ?: 0.0
-            val rmax = randomObj.optDouble("max", 0.0).takeIf { it.isFinite() } ?: 0.0
-            val rollover = optPositiveDouble(b, "rollover")
+            val rMin = optFiniteDouble(randomObj, "min")
+            val rMax = optFiniteDouble(randomObj, "max")
+            val hasRandomRange = rMax != null && rMax > 0.0
 
-            val amount: Double
+            val resolvedAmount: Double
             val amountDisplay: String
-            var isPercent = false
-
-            when {
-                fixed > 0.0 -> {
-                    amount = fixed
-                    amountDisplay = FormatUtil.moneyCompact(fixed)
-                }
-                rmax > 0.0 -> {
-                    amount = rmax
-                    amountDisplay = "${FormatUtil.moneyCompact(rmin)}–${FormatUtil.moneyCompact(rmax)}"
-                }
-                percent > 0.0 -> {
-                    amount = 0.0
-                    val pctStr = if (percent % 1.0 == 0.0) {
-                        percent.toInt().toString()
+            if (lit) {
+                if (displayAmountFlag == 0) {
+                    if (hasRandomRange) {
+                        resolvedAmount = if (liveAmount > 0.0) liveAmount else 0.0
+                        amountDisplay = formatRandomRange(rMin ?: 0.0, rMax!!)
                     } else {
-                        String.format(Locale.US, "%.0f", percent)
+                        resolvedAmount = liveAmount
+                        amountDisplay = "?"
                     }
-                    amountDisplay = "$pctStr% match"
-                    isPercent = true
+                } else if (liveAmount > 0.0) {
+                    resolvedAmount = liveAmount
+                    amountDisplay = FormatUtil.moneyCompact(liveAmount)
+                } else if (hasRandomRange) {
+                    resolvedAmount = 0.0
+                    amountDisplay = formatRandomRange(rMin ?: 0.0, rMax!!)
+                } else {
+                    resolvedAmount = 0.0
+                    amountDisplay = "?"
                 }
-                else -> continue
+            } else {
+                resolvedAmount = 0.0
+                amountDisplay = ""
             }
 
-            val minW = optPositiveDouble(claimConfig, "minWithdraw")
+            val hideMin = optIntFlag(claimConfig, "minWithdrawTimeAmount") != 0
+            val rawMinW = optPositiveDouble(b, "minWithdraw")
+                ?: optPositiveDouble(b, "minWithdrawal")
+                ?: optPositiveDouble(claimConfig, "minWithdraw")
                 ?: optPositiveDouble(claimConfig, "minWithdrawal")
-                ?: optPositiveDouble(b, "minWithdraw")
-            val maxW = optPositiveDouble(claimConfig, "maxWithdraw")
+            val minW = if (!hideMin && rawMinW != null && rawMinW >= 0.01) rawMinW else null
+
+            val rawMaxW = optPositiveDouble(b, "maxWithdraw")
+                ?: optPositiveDouble(b, "maxWithdrawal")
+                ?: optPositiveDouble(claimConfig, "maxWithdraw")
                 ?: optPositiveDouble(claimConfig, "maxWithdrawal")
-                ?: optPositiveDouble(b, "maxWithdraw")
+            val maxW = if (rawMaxW != null && rawMaxW >= 0.01) rawMaxW else null
+            val isAngpaoPercentMax = txType == "ANGPAO" && maxW != null && maxW < 1.0
+            val maxDisplay = maxW?.let {
+                if (isAngpaoPercentMax) {
+                    "${kotlin.math.round(it * 100.0).toInt()}%"
+                } else {
+                    FormatUtil.moneyCompact(it)
+                }
+            }
+
+            val minBet = optPositiveDouble(b, "minBet")?.takeIf { it >= 0.01 }
+            val mobileAppOnly = optIntFlag(claimConfig, "mobileAppOnly") == 1 ||
+                claimConfig.optBoolean("mobileAppOnly", false)
+            val detail = buildBonusDetail(b, claimConfig, txType).ifBlank { null }
 
             val view = BonusView(
                 name = name,
-                amount = amount,
+                amount = resolvedAmount,
                 amountDisplay = amountDisplay,
                 minWithdrawal = minW,
                 maxWithdrawal = maxW,
-                rollover = rollover,
-                isPercent = isPercent
+                rollover = minBet,
+                isPercent = false,
+                maxDisplay = maxDisplay,
+                detail = detail,
+                lit = lit,
+                mobileAppOnly = mobileAppOnly,
+                packetId = packetId,
+                transactionId = transactionId,
+                angpaoId = angpaoId,
+                luckyId = luckyId
             )
             availableBonuses.add(view)
 
-            when (categoryOf(name, custom)) {
+            if (!lit) continue
+            val custom = claimConfig.optString("customBonus", "")
+            when (SiteOrderUtil.bonusCategoryKey(name, custom, txType)) {
                 "commission" -> commissionList.add(view)
                 "share" -> shareList.add(view)
                 "referral" -> referralList.add(view)
@@ -839,13 +1356,17 @@ class CasinoApiService {
             }
         }
 
-        availableBonuses.sortWith(compareByDescending<BonusView> { it.amount }.thenBy { it.name })
+        availableBonuses.sortWith(
+            compareByDescending<BonusView> { it.lit }
+                .thenBy { SiteOrderUtil.bonusTurnover(it) ?: Double.POSITIVE_INFINITY }
+                .thenByDescending { it.amount }
+                .thenBy { it.name.lowercase(Locale.US) }
+        )
 
         fun pick(list: List<BonusView>): BonusView? {
-            if (list.isEmpty()) return null
-            val dollars = list.filter { !it.isPercent }
-            val pool = dollars.ifEmpty { list }
-            return pool.maxByOrNull { it.amount }
+            val litOnly = list.filter { it.lit }
+            if (litOnly.isEmpty()) return null
+            return litOnly.maxByOrNull { it.amount }
         }
 
         val commission = pick(commissionList)
@@ -854,13 +1375,8 @@ class CasinoApiService {
         val fresh = pick(newList)
         val rebate = pick(rebateList)
 
-        val hasData = cash > 0.001 ||
-            commission != null ||
-            share != null ||
-            referral != null ||
-            fresh != null ||
-            rebate != null ||
-            availableBonuses.isNotEmpty()
+        val hasLitUnclaimed = availableBonuses.any { it.lit }
+        val hasData = wallets.any { it.balance > 0.001 } || cash > 0.001 || hasLitUnclaimed
 
         return AccountResult.Ok(
             domain = domain,
@@ -880,6 +1396,160 @@ class CasinoApiService {
             retriesUsed = retriesUsed,
             fetchedAt = System.currentTimeMillis()
         )
+    }
+
+    private fun holdsAmount(raw: Any?): Boolean {
+        if (raw == null || raw === JSONObject.NULL) return false
+        return when (raw) {
+            is Number -> raw.toDouble().isFinite()
+            is String -> {
+                val trimmed = raw.trim()
+                trimmed.isNotEmpty() && trimmed.toDoubleOrNull()?.isFinite() == true
+            }
+            else -> false
+        }
+    }
+
+    private fun isVisiblePacket(
+        bonus: JSONObject,
+        cfg: JSONObject,
+        txType: String,
+        cleanBonusName: String
+    ): Boolean {
+        if (txType == "REBATE" || txType == "COMMISSION" || txType == "ANGPAO" ||
+            cleanBonusName.equals("Lucky Draw", ignoreCase = true)
+        ) {
+            return true
+        }
+        val showIf = optIntFlag(cfg, "showIfAmount")
+        if (showIf == 1 && !holdsAmount(bonus.opt("amount"))) {
+            return false
+        }
+        return true
+    }
+
+    private fun isWithinWindow(bonus: JSONObject, nowMs: Long): Boolean {
+        val start = parseWindowTimestamp(bonus.optString("startDateTime", ""))
+        val end = parseWindowTimestamp(bonus.optString("endDateTime", ""))
+        if (start != null && nowMs < start) return false
+        if (end != null && nowMs > end) return false
+        return true
+    }
+
+    private fun parseWindowTimestamp(raw: String): Long? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed.equals("null", ignoreCase = true)) return null
+        val isoEpoch = FormatUtil.parseIsoEpochMs(trimmed)
+        if (isoEpoch > 0L) return isoEpoch
+        val formats = arrayOf(
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd"
+        )
+        for (pattern in formats) {
+            try {
+                val sdf = java.text.SimpleDateFormat(pattern, Locale.US)
+                sdf.isLenient = false
+                val parsed = sdf.parse(trimmed)
+                if (parsed != null) return parsed.time
+            } catch (_: Exception) {
+                // Try next format
+            }
+        }
+        return null
+    }
+
+    private fun formatRandomRange(minVal: Double, maxVal: Double): String {
+        return if (minVal > 0.0 && maxVal > minVal) {
+            "${FormatUtil.moneyCompact(minVal)}–${FormatUtil.moneyCompact(maxVal)}"
+        } else {
+            FormatUtil.moneyCompact(maxVal)
+        }
+    }
+
+    private fun buildBonusDetail(
+        bonus: JSONObject,
+        cfg: JSONObject,
+        txType: String
+    ): String {
+        if (optIntFlag(cfg, "displayDescriptionOnly") != 0) return ""
+        val parts = mutableListOf<String>()
+        val turnover = optPositiveDouble(bonus, "minBet")
+        if (turnover != null && turnover >= 0.01) {
+            parts.add("Turnover ${FormatUtil.moneyCompact(turnover)}")
+        }
+        val hideMin = optIntFlag(cfg, "minWithdrawTimeAmount") != 0
+        val minW = optPositiveDouble(bonus, "minWithdraw")
+        if (!hideMin && minW != null && minW >= 0.01) {
+            parts.add("Min ${FormatUtil.moneyCompact(minW)}")
+        }
+        val maxW = optPositiveDouble(bonus, "maxWithdraw")
+        if (maxW != null && maxW >= 0.01) {
+            val isAngpaoPct = txType == "ANGPAO" && maxW < 1.0
+            val formattedMax = if (isAngpaoPct) {
+                "${kotlin.math.round(maxW * 100.0).toInt()}%"
+            } else {
+                FormatUtil.moneyCompact(maxW)
+            }
+            parts.add("Max $formattedMax")
+        }
+        val minTop = optPositiveDouble(bonus, "minTopup")
+        val maxTop = optPositiveDouble(bonus, "maxTopup")
+        when {
+            minTop != null && maxTop != null ->
+                parts.add("Deposit ${FormatUtil.moneyCompact(minTop)}–${FormatUtil.moneyCompact(maxTop)}")
+            minTop != null -> parts.add("Min deposit ${FormatUtil.moneyCompact(minTop)}")
+            maxTop != null -> parts.add("Max deposit ${FormatUtil.moneyCompact(maxTop)}")
+        }
+        val minRound = optPositiveDouble(bonus, "minRound")
+        if (minRound != null && minRound > 0.0) {
+            parts.add("Deposits ${minRound.toInt()}")
+        }
+        val maxRound = optPositiveDouble(bonus, "maxRound")
+        val reset = bonus.optString("reset", "").trim().uppercase(Locale.US)
+        if (maxRound != null && maxRound > 0.0 && reset.isNotEmpty()) {
+            val period = when (reset) {
+                "DAILY" -> "day"
+                "WEEKLY" -> "week"
+                "MONTHLY" -> "month"
+                else -> "hour"
+            }
+            parts.add("Limited to ${maxRound.toInt()} claim per $period")
+        }
+        return parts.joinToString(" · ")
+    }
+
+    private fun optLongId(obj: JSONObject, key: String): Long {
+        if (!obj.has(key) || obj.isNull(key)) return 0L
+        return when (val raw = obj.opt(key)) {
+            is Number -> raw.toLong()
+            is String -> raw.trim().toLongOrNull() ?: 0L
+            else -> 0L
+        }
+    }
+
+    private fun optIntFlag(obj: JSONObject, key: String): Int {
+        return optIntOrNull(obj, key) ?: 0
+    }
+
+    private fun optIntOrNull(obj: JSONObject, key: String): Int? {
+        if (!obj.has(key) || obj.isNull(key)) return null
+        return when (val raw = obj.opt(key)) {
+            is Number -> raw.toInt()
+            is Boolean -> if (raw) 1 else 0
+            is String -> raw.trim().toIntOrNull()
+            else -> null
+        }
+    }
+
+    private fun optFiniteDouble(obj: JSONObject, key: String): Double? {
+        if (!obj.has(key) || obj.isNull(key)) return null
+        val v = when (val raw = obj.opt(key)) {
+            is Number -> raw.toDouble()
+            is String -> raw.trim().toDoubleOrNull()
+            else -> null
+        }
+        return if (v != null && v.isFinite()) v else null
     }
 
     private fun parsePublicPromotions(raw: JSONArray?): List<PublicBonus> {
@@ -1011,6 +1681,6 @@ class CasinoApiService {
 
     private class TransientHttpException(message: String) : IOException(message)
     private class BlockedException(message: String) : Exception(message)
-    private class RateLimitException(message: String) : Exception(message)
+    private class RateLimitException(message: String, val retryAfterSec: Long? = null) : Exception(message)
     private class BadJsonException(message: String) : Exception(message)
 }

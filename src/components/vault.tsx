@@ -21,6 +21,26 @@ const KEY = "pokies_vault_v1";
 const LIST_EPOCH = "pokies_vault_user_list_v1";
 const LIST_ERROR = "The domain list could not be saved on this device, so that change was not kept.";
 
+export const CARD_COLORS = [
+  { id: "classic", label: "Off", swatch: "" },
+  { id: "pink", label: "Pink", swatch: "#ff4fd8" },
+  { id: "blue", label: "Blue", swatch: "#3aa0ff" },
+  { id: "purple", label: "Purple", swatch: "#a855f7" },
+  { id: "green", label: "Green", swatch: "#3ddc97" },
+  { id: "teal", label: "Teal", swatch: "#2ee6d6" },
+  { id: "yellow", label: "Yellow", swatch: "#ffe14a" },
+  { id: "gold", label: "Gold", swatch: "#f0b429" },
+  { id: "orange", label: "Orange", swatch: "#ff8a2a" },
+  { id: "red", label: "Red", swatch: "#ff4d6a" },
+  { id: "white", label: "White", swatch: "#e8eeff" },
+] as const;
+
+export type CardColor = (typeof CARD_COLORS)[number]["id"];
+
+function isCardColor(value: unknown): value is CardColor {
+  return typeof value === "string" && CARD_COLORS.some((item) => item.id === value);
+}
+
 function writeVault(state: VaultState) {
   const { listOwned: _listOwned, sites: _sites, ...rest } = state;
   localStorage.setItem(KEY, JSON.stringify(rest));
@@ -72,10 +92,12 @@ export type VaultState = {
   attentionChecked: AttentionMark[];
   view: ViewMode;
   notVisited: boolean;
+  signupOnly: boolean;
   wallets: boolean;
   mineOnly: boolean;
   sort: SortMode;
   bonusMode: BonusMode;
+  cardColor: CardColor;
   theme: ThemeId;
 };
 
@@ -98,10 +120,12 @@ const EMPTY: VaultState = {
   attentionChecked: [],
   view: "default",
   notVisited: false,
+  signupOnly: false,
   wallets: false,
   mineOnly: false,
   sort: "default",
   bonusMode: "none",
+  cardColor: "classic",
   theme: "vault",
 };
 
@@ -152,8 +176,10 @@ function load(): VaultState {
           ? parsed.fallbacks
           : EMPTY.fallbacks,
       logins: cleanLogins(parsed.logins),
+      signupOnly: Boolean(parsed.signupOnly),
       sort: isSortMode(parsed.sort) ? parsed.sort : EMPTY.sort,
       bonusMode: parsed.bonusMode ?? EMPTY.bonusMode,
+      cardColor: isCardColor(parsed.cardColor) ? parsed.cardColor : EMPTY.cardColor,
       theme: isThemeId(parsed.theme) ? parsed.theme : EMPTY.theme,
       attentionChecked: Array.isArray(parsed.attentionChecked)
         ? parsed.attentionChecked.filter(
@@ -235,6 +261,10 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     document.documentElement.dataset.theme = theme.id;
     document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme.bg);
   }, [state.theme]);
+
+  useEffect(() => {
+    document.documentElement.dataset.cardColor = state.cardColor;
+  }, [state.cardColor]);
 
   const persist = useCallback((next: VaultState) => {
     setState(next);

@@ -3,10 +3,12 @@ package com.aistudio.pokiesvault.ui.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.aistudio.pokiesvault.PokiesVaultApp
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.BonusAmountSort
 import com.aistudio.pokiesvault.data.model.BonusMode
-import com.aistudio.pokiesvault.data.model.CheckpointPauseReason
+import com.aistudio.pokiesvault.data.model.BonusStatusFilter
+import com.aistudio.pokiesvault.data.model.CardColor
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.FallbackCred
@@ -17,6 +19,7 @@ import com.aistudio.pokiesvault.data.model.PublicBonus
 import com.aistudio.pokiesvault.data.model.PublicBonusKind
 import com.aistudio.pokiesvault.data.model.PublicBonusSiteCache
 import com.aistudio.pokiesvault.data.model.PublicBonusSlot
+import com.aistudio.pokiesvault.data.model.SavedDomainSession
 import com.aistudio.pokiesvault.data.model.SiteGroup
 import com.aistudio.pokiesvault.data.model.SiteRecord
 import com.aistudio.pokiesvault.data.model.SiteStatus
@@ -25,34 +28,29 @@ import com.aistudio.pokiesvault.data.model.VaultCredentials
 import com.aistudio.pokiesvault.data.model.VaultPreferences
 import com.aistudio.pokiesvault.data.model.VaultThemeId
 import com.aistudio.pokiesvault.data.model.ViewMode
-import com.aistudio.pokiesvault.data.repository.VaultRepository
 import com.aistudio.pokiesvault.util.DomainUtil
 import com.aistudio.pokiesvault.util.FormatUtil
+import com.aistudio.pokiesvault.util.SiteOrderUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.util.Locale
-import kotlin.math.abs
 
 data class EgressUiState(
     val isLoading: Boolean = true,
@@ -61,12 +59,19 @@ data class EgressUiState(
 )
 
 data class DirectorySiteItem(
+    val rank: Int,
     val site: SiteRecord,
+    val relativeAge: String,
     val status: SiteStatus,
     val latencyMs: Long,
     val account: AccountResult.Ok?,
-    val walletText: String?,
-    val bonusText: String?
+    val errorRow: AccountResult.Err? = null,
+    val sameCasinoCount: Int = 0,
+    val hasSignupBonus: Boolean = false,
+    val hasReferlink: Boolean = false,
+    val popularityScore: Double = 0.0,
+    val walletText: String? = null,
+    val bonusText: String? = null
 )
 
 data class DirectoryUiState(
@@ -98,7 +103,8 @@ data class FetcherUiState(
     val progressTotal: Int = 0,
     val activeWorkers: Int = 0,
     val peakWorkers: Int = 0,
-    val workerLimit: Int = 3,
+    val workerLimit: Int = 6,
+    val allowBackgroundRuns: Boolean = false,
     val liveStatusLabel: String = "Idle",
     val wallElapsedSec: Long = 0L,
     val signInElapsedSec: Long = 0L,
@@ -107,16 +113,33 @@ data class FetcherUiState(
     val statusMessage: String = "Enter your phone and password to fetch wallets and bonuses safely.",
     val validAccounts: List<AccountResult.Ok> = emptyList(),
     val emptyAccounts: List<AccountResult.Ok> = emptyList(),
+    val validItems: List<DirectorySiteItem> = emptyList(),
+    val emptyItems: List<DirectorySiteItem> = emptyList(),
     val rejectedAccounts: List<AccountResult.Err> = emptyList(),
     val rejectedGroups: List<RejectedReasonGroup> = emptyList(),
     val retryableDomains: List<String> = emptyList(),
     val totalCash: Double = 0.0,
+    val rawSignedInCount: Int = 0,
+    val rawRejectedCount: Int = 0,
+    val rawWithBalanceCount: Int = 0,
+    val rawNothingWaitingCount: Int = 0,
+    val sortMode: SortMode = SortMode.DEFAULT,
+    val bonusMode: BonusMode = BonusMode.NONE,
+    val cardColor: CardColor = CardColor.CLASSIC,
+    val walletsMode: Boolean = true,
+    val notVisitedFilter: Boolean = false,
+    val signupOnlyFilter: Boolean = false,
+    val mineOnlyFilter: Boolean = false,
     val fetchDiffs: List<String> = emptyList(),
     val showRejectedSites: Boolean = false,
     val mineTargetDomains: List<String> = emptyList(),
     val allTargetDomains: List<String> = emptyList(),
     val fetchRuns: List<FetchRunSummary> = emptyList(),
-    val viewingRunId: Long? = null
+    val viewingRunId: Long? = null,
+    val cooldownSeconds: Int = 0,
+    val cooldownReason: String = "",
+    val sessionReusedCount: Int = 0,
+    val savedSessionDomains: Set<String> = emptySet()
 )
 
 data class BonusFinderItem(
@@ -132,15 +155,36 @@ data class BonusFinderItem(
 
 data class BonusFinderUiState(
     val searchQuery: String = "",
+    val statusFilter: BonusStatusFilter = BonusStatusFilter.ALL,
     val selectedSlots: Set<PublicBonusSlot> = emptySet(),
     val listOrderSlot: PublicBonusSlot? = null,
     val amountSort: BonusAmountSort = BonusAmountSort.DOMAIN_AZ,
+    val speedPreset: FetchSpeedPreset = FetchSpeedPreset.SAFE,
+    val activeCheckpoint: FetchCheckpoint? = null,
     val items: List<BonusFinderItem> = emptyList(),
     val totalDomains: Int = 0,
     val loadedCount: Int = 0,
+    val loadedTotalCount: Int = 0,
+    val failedTotalCount: Int = 0,
+    val unloadedTotalCount: Int = 0,
+    val withOffersCount: Int = 0,
+    val failedDomains: List<String> = emptyList(),
+    val unloadedDomains: List<String> = emptyList(),
+    val allTargetDomains: List<String> = emptyList(),
     val isScanning: Boolean = false,
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
+    val activeWorkers: Int = 0,
+    val peakWorkers: Int = 0,
+    val workerLimit: Int = 6,
+    val allowBackgroundRuns: Boolean = false,
+    val liveStatusLabel: String = "Idle",
+    val wallElapsedSec: Long = 0L,
+    val scanElapsedSec: Long = 0L,
+    val totalRetries: Int = 0,
+    val totalAttempts: Int = 0,
+    val runLoadedCount: Int = 0,
+    val runFailedCount: Int = 0,
     val statusMessage: String = "Scan public promotions across your domain list without signing in."
 )
 
@@ -163,6 +207,7 @@ data class IntelUiState(
     val redirectCount: Int = 0,
     val downCount: Int = 0,
     val isChecking: Boolean = false,
+    val isFetchingLatestList: Boolean = false,
     val progressDone: Int = 0,
     val progressTotal: Int = 0,
     val statusMessage: String = "Unified list shared across Directory, Fetcher, and Bonus Finder."
@@ -170,10 +215,13 @@ data class IntelUiState(
 
 data class VaultGlobalUiState(
     val themeId: VaultThemeId = VaultThemeId.VAULT,
+    val allowBackgroundRuns: Boolean = false,
+    val hasActiveBackgroundRun: Boolean = false,
     val savedAccountsCount: Int = 0,
     val hiddenDomainsCount: Int = 0,
     val isAddDomainOpen: Boolean = false,
     val isSortFilterOpen: Boolean = false,
+    val isNotVisitedAuthAlertOpen: Boolean = false,
     val isConfirmScanOpen: Boolean = false,
     val isFetchHistoryOpen: Boolean = false,
     val selectedDetailDomain: String? = null
@@ -181,17 +229,26 @@ data class VaultGlobalUiState(
 
 @OptIn(FlowPreview::class)
 class VaultViewModel(application: Application) : AndroidViewModel(application) {
-    private val repository = VaultRepository(application)
+    private val app = application as PokiesVaultApp
+    private val repository = app.repository
+    private val coordinator = app.coordinator
 
-    private val _snackbarEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
-    val snackbarEvents: SharedFlow<String> = _snackbarEvents.asSharedFlow()
+    val snackbarEvents: SharedFlow<String> = coordinator.snackbarEvents
+
+    val egressState: StateFlow<EgressUiState> = coordinator.egressState
+        .map { EgressUiState(isLoading = it.isLoading, info = it.info, error = it.error) }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, EgressUiState())
 
     // --- Shared Dialog & Modal State ---
     private val _modalState = MutableStateFlow(VaultGlobalUiState())
 
+    private val _captchaSignInDomain = MutableStateFlow<String?>(null)
+    val captchaSignInDomain: StateFlow<String?> = _captchaSignInDomain.asStateFlow()
+
     // --- Raw Input Flows ---
     private val _directorySearch = MutableStateFlow("")
     private val _bonusSearch = MutableStateFlow("")
+    private val _bonusStatusFilter = MutableStateFlow(BonusStatusFilter.ALL)
     private val _bonusSelectedSlots = MutableStateFlow<Set<PublicBonusSlot>>(emptySet())
     private val _bonusListOrderSlot = MutableStateFlow<PublicBonusSlot?>(null)
     private val _bonusAmountSort = MutableStateFlow(BonusAmountSort.DOMAIN_AZ)
@@ -199,42 +256,25 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val _intelStatusFilter = MutableStateFlow<SiteStatus?>(null)
     private val _intelSelectedDomains = MutableStateFlow<Set<String>>(emptySet())
 
-    // --- Ephemeral Checking/Scanning State ---
-    private val _egressState = MutableStateFlow(EgressUiState())
-    val egressState: StateFlow<EgressUiState> = _egressState.asStateFlow()
-
+    // --- Local Ephemeral State ---
     private val _checkingDomains = MutableStateFlow<Set<String>>(emptySet())
-    private val _fetcherRows = MutableStateFlow<List<AccountResult>>(emptyList())
-    private val _fetcherRunning = MutableStateFlow(false)
-    private val _fetcherProgress = MutableStateFlow(0 to 0)
-    private val _fetcherStatus = MutableStateFlow("Enter your phone and password to fetch wallets and bonuses concurrently.")
-    private val _liveStatusLabel = MutableStateFlow("Idle")
-    private val _wallElapsedSec = MutableStateFlow(0L)
-    private val _fetcherDiffs = MutableStateFlow<List<String>>(emptyList())
-    private val _showRejected = MutableStateFlow(false)
-    private val _viewingRunId = MutableStateFlow<Long?>(null)
-
-    private val _bonusRunning = MutableStateFlow(false)
-    private val _bonusProgress = MutableStateFlow(0 to 0)
-    private val _bonusStatus = MutableStateFlow("Scan public promotions across your domain list without signing in.")
-
     private val _intelRunning = MutableStateFlow(false)
+    private val _intelFetchingLatest = MutableStateFlow(false)
     private val _intelProgress = MutableStateFlow(0 to 0)
     private val _intelStatus = MutableStateFlow("Unified list shared across Directory, Fetcher, and Bonus Finder.")
 
-    private var fetchJob: Job? = null
-    private var wallTimerJob: Job? = null
-    private var egressJob: Job? = null
-    private var bonusScanJob: Job? = null
     private var intelCheckJob: Job? = null
+    private var intelLatestFetchJob: Job? = null
     private var credSaveJob: Job? = null
 
     private val inFlightProbeMutex = Mutex()
     private val inFlightProbes = mutableSetOf<String>()
     private val statusTtlMs = 15L * 60L * 1000L // 15 minutes cache TTL
 
-    private val preferencesFlow = repository.preferencesFlow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, VaultPreferences())
+    private val preferencesFlow = coordinator.preferencesFlow
+    private val credentialsFlow = coordinator.credentialsFlow
+    private val checkpointFlow = coordinator.checkpointFlow
+    private val bonusCheckpointFlow = coordinator.bonusCheckpointFlow
 
     private val visibleSitesFlow = repository.visibleSitesFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -245,31 +285,39 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     private val latestAccountsFlow = repository.latestAccountsByDomainFlow
         .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
-    private val credentialsFlow = repository.credentialsFlow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, VaultCredentials())
+    private val latestResultsFlow = repository.latestResultsByDomainFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
-    private val checkpointFlow = repository.checkpointFlow
-        .stateIn(viewModelScope, SharingStarted.Eagerly, null)
+    private val sameCasinoCountsFlow = repository.sameCasinoCountsFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
+
+    private val domainSessionsFlow = repository.domainSessionsFlow
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyMap())
 
     val globalState: StateFlow<VaultGlobalUiState> = combine(
         preferencesFlow,
         visibleSitesFlow,
         repository.hiddenCountFlow,
+        coordinator.hasActiveRun,
         _modalState
-    ) { prefs, sites, hiddenCount, modals ->
+    ) { prefs, sites, hiddenCount, activeRun, modals ->
         modals.copy(
             themeId = prefs.themeId,
+            allowBackgroundRuns = prefs.allowBackgroundRuns,
+            hasActiveBackgroundRun = prefs.allowBackgroundRuns && activeRun,
             savedAccountsCount = sites.count { it.isMine },
             hiddenDomainsCount = hiddenCount
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), VaultGlobalUiState())
 
-    // --- Module 1: Directory State (Off-main-thread filter/group/sort pipeline) ---
+    // --- Module 1: Directory State ---
     val directoryState: StateFlow<DirectoryUiState> = combine(
         preferencesFlow,
         visibleSitesFlow,
         healthMapFlow,
         latestAccountsFlow,
+        latestResultsFlow,
+        sameCasinoCountsFlow,
         _checkingDomains,
         _directorySearch.debounce(120)
     ) { arr ->
@@ -281,54 +329,72 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         @Suppress("UNCHECKED_CAST")
         val accountsMap = arr[3] as Map<String, AccountResult.Ok>
         @Suppress("UNCHECKED_CAST")
-        val checking = arr[4] as Set<String>
-        val query = (arr[5] as String).trim().lowercase(Locale.US)
+        val resultsMap = arr[4] as Map<String, AccountResult>
+        @Suppress("UNCHECKED_CAST")
+        val sameCasinoMap = arr[5] as Map<String, Int>
+        @Suppress("UNCHECKED_CAST")
+        val checking = arr[6] as Set<String>
+        val query = (arr[7] as String).trim()
+
+        val catalogIndexByDomain = HashMap<String, Int>(sites.size)
+        sites.forEachIndexed { idx, s -> catalogIndexByDomain[s.domain] = idx }
 
         val filtered = sites.filter { site ->
+            val ok = accountsMap[site.domain]
             if (prefs.mineOnly && !site.isMine) return@filter false
             if (prefs.notVisited && site.isVisited) return@filter false
-            if (query.isNotEmpty() && !site.domain.contains(query)) return@filter false
+            if (prefs.signupOnly && !SiteOrderUtil.isLitBonus(ok?.newMember)) return@filter false
+            if (query.isNotEmpty() && !DomainUtil.matchesSearch(site.domain, query)) return@filter false
             true
         }
 
-        val sorted = when (prefs.sortMode) {
-            SortMode.AZ -> filtered.sortedBy { it.domain }
-            SortMode.ZA -> filtered.sortedByDescending { it.domain }
-            SortMode.NEW -> filtered.sortedByDescending { it.addedAt }
-            SortMode.BALANCE -> filtered.sortedWith(
-                compareByDescending<SiteRecord> { accountsMap[it.domain]?.cash ?: -1.0 }
-                    .thenBy { it.domain }
-            )
-            SortMode.DEFAULT -> filtered
-        }
-
-        val uiItems = sorted.map { site ->
+        val entries = filtered.map { site ->
             val health = healthMap[site.domain]
             val status = when {
                 checking.contains(site.domain) -> SiteStatus.CHECKING
                 health != null -> health.status
                 else -> SiteStatus.UNKNOWN
             }
-            val acc = accountsMap[site.domain]
+            val latestRes: AccountResult? = resultsMap[site.domain] ?: accountsMap[site.domain]
+            val sortable = SiteOrderUtil.SortableEntry(
+                domain = site.domain,
+                group = site.group,
+                addedAt = site.addedAt,
+                catalogIndex = catalogIndexByDomain[site.domain] ?: 0,
+                result = latestRes,
+                isDead = status == SiteStatus.DEAD
+            )
+            Triple(site, status, sortable)
+        }
+
+        val sorted = entries.sortedWith { a, b ->
+            SiteOrderUtil.compareEntries(a.third, b.third, prefs.sortMode, prefs.bonusMode)
+        }
+
+        val uiItems = sorted.mapIndexed { idx, (site, status, sortable) ->
+            val health = healthMap[site.domain]
+            val acc = (sortable.result as? AccountResult.Ok) ?: accountsMap[site.domain]
+            val err = sortable.result as? AccountResult.Err
             val walletText = if (prefs.wallets && acc != null) {
-                "${FormatUtil.money(acc.cash)} · ${acc.cashWalletName}"
+                "${FormatUtil.money(SiteOrderUtil.effectiveCash(acc))} · ${acc.cashWalletName}"
             } else null
-            val bonusText = if (acc != null) {
-                when (prefs.bonusMode) {
-                    BonusMode.NEW -> acc.newMember?.let { "${it.name} ${it.amountDisplay}" }
-                    BonusMode.SHARE -> acc.share?.let { "${it.name} ${it.amountDisplay}" }
-                    BonusMode.COMMISSION -> acc.commission?.let { "${it.name} ${it.amountDisplay}" }
-                    BonusMode.REFERRAL -> acc.referral?.let { "${it.name} ${it.amountDisplay}" }
-                    BonusMode.REBATE -> acc.rebate?.let { "${it.name} ${it.amountDisplay}" }
-                    BonusMode.NONE -> null
-                }
+            val chosen = if (prefs.bonusMode != BonusMode.NONE) {
+                acc?.bonusFor(prefs.bonusMode)
             } else null
+            val bonusText = chosen?.let { "${it.name} ${it.amountDisplay}" }
 
             DirectorySiteItem(
+                rank = idx + 1,
                 site = site,
+                relativeAge = FormatUtil.timeAgo(site.addedAt),
                 status = status,
                 latencyMs = health?.latencyMs ?: 0L,
                 account = acc,
+                errorRow = err,
+                sameCasinoCount = sameCasinoMap[site.domain] ?: 0,
+                hasSignupBonus = SiteOrderUtil.isLitBonus(acc?.newMember),
+                hasReferlink = SiteOrderUtil.hasReferlink(acc),
+                popularityScore = SiteOrderUtil.popularityScore(site.group, sortable.catalogIndex),
                 walletText = walletText,
                 bonusText = bonusText
             )
@@ -338,16 +404,19 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             query.isEmpty() &&
             !prefs.mineOnly &&
             !prefs.notVisited &&
+            !prefs.signupOnly &&
             prefs.sortMode == SortMode.DEFAULT
 
         val grouped = if (isGrouped) {
             val orderedGroups = listOf(
+                SiteGroup.PROMOTED,
                 SiteGroup.CUSTOM,
                 SiteGroup.NEW,
                 SiteGroup.BEST,
                 SiteGroup.SHARE,
                 SiteGroup.UNVERIFIED,
-                SiteGroup.LATEST
+                SiteGroup.LATEST,
+                SiteGroup.CONFIRMED_SCAMS
             )
             LinkedHashMap<SiteGroup, List<DirectorySiteItem>>().apply {
                 for (g in orderedGroups) {
@@ -368,7 +437,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             totalSitesCount = uiItems.size,
             visitedCount = uiItems.count { it.site.isVisited },
             mineCount = sites.count { it.isMine },
-            totalCachedCash = accountsMap.values.sumOf { it.cash },
+            totalCachedCash = accountsMap.values.sumOf { SiteOrderUtil.effectiveCash(it) },
             isLoading = false
         )
     }
@@ -378,53 +447,165 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     val directorySearchInput: StateFlow<String> = _directorySearch.asStateFlow()
 
-    // --- Module 2: Account Fetcher State ---
+    // --- Module 2: Account Fetcher State (Backed by Coordinator) ---
     val fetcherState: StateFlow<FetcherUiState> = combine(
         credentialsFlow,
         visibleSitesFlow,
-        _fetcherRows,
-        _fetcherRunning,
-        _fetcherProgress,
-        _fetcherStatus,
-        _fetcherDiffs,
-        _showRejected,
+        healthMapFlow,
+        sameCasinoCountsFlow,
+        coordinator.fetcherRows,
+        coordinator.fetcherRunning,
+        coordinator.fetcherProgress,
+        coordinator.fetcherStatus,
+        coordinator.fetcherDiffs,
+        coordinator.showRejected,
         repository.fetchRunsFlow,
         repository.engine.activeWorkers,
         repository.engine.peakWorkers,
         repository.engine.currentWorkerLimit,
-        _liveStatusLabel,
-        _wallElapsedSec,
-        _viewingRunId,
+        coordinator.liveStatusLabel,
+        coordinator.wallElapsedSec,
+        coordinator.viewingRunId,
         preferencesFlow,
-        checkpointFlow
+        checkpointFlow,
+        coordinator.cooldownSeconds,
+        coordinator.cooldownReason,
+        coordinator.sessionReusedCount,
+        domainSessionsFlow
     ) { arr ->
         val creds = arr[0] as VaultCredentials
         @Suppress("UNCHECKED_CAST")
         val sites = arr[1] as List<SiteRecord>
         @Suppress("UNCHECKED_CAST")
-        val rows = arr[2] as List<AccountResult>
-        val running = arr[3] as Boolean
+        val healthMap = arr[2] as Map<String, DomainHealthRecord>
         @Suppress("UNCHECKED_CAST")
-        val progress = arr[4] as Pair<Int, Int>
-        val statusMsg = arr[5] as String
+        val sameCasinoMap = arr[3] as Map<String, Int>
         @Suppress("UNCHECKED_CAST")
-        val diffs = arr[6] as List<String>
-        val showRej = arr[7] as Boolean
+        val rows = arr[4] as List<AccountResult>
+        val running = arr[5] as Boolean
         @Suppress("UNCHECKED_CAST")
-        val runs = arr[8] as List<FetchRunSummary>
-        val activeW = arr[9] as Int
-        val peakW = arr[10] as Int
-        val limitW = arr[11] as Int
-        val liveLabel = arr[12] as String
-        val wallSec = arr[13] as Long
-        val viewRunId = arr[14] as Long?
-        val prefs = arr[15] as VaultPreferences
-        val checkpoint = arr[16] as FetchCheckpoint?
+        val progress = arr[6] as Pair<Int, Int>
+        val statusMsg = arr[7] as String
+        @Suppress("UNCHECKED_CAST")
+        val diffs = arr[8] as List<String>
+        val showRej = arr[9] as Boolean
+        @Suppress("UNCHECKED_CAST")
+        val runs = arr[10] as List<FetchRunSummary>
+        val activeW = arr[11] as Int
+        val peakW = arr[12] as Int
+        val limitW = arr[13] as Int
+        val liveLabel = arr[14] as String
+        val wallSec = arr[15] as Long
+        val viewRunId = arr[16] as Long?
+        val prefs = arr[17] as VaultPreferences
+        val checkpoint = arr[18] as FetchCheckpoint?
+        val cooldownSec = arr[19] as Int
+        val cooldownReason = arr[20] as String
+        val reusedCount = arr[21] as Int
+        @Suppress("UNCHECKED_CAST")
+        val savedSessionsMap = arr[22] as Map<String, SavedDomainSession>
 
-        val okList = rows.filterIsInstance<AccountResult.Ok>()
-        val valid = okList.filter { it.hasData }.sortedWith(compareByDescending<AccountResult.Ok> { it.cash }.thenBy { it.domain })
-        val empty = okList.filter { !it.hasData }.sortedBy { it.domain }
-        val rejected = rows.filterIsInstance<AccountResult.Err>().sortedBy { it.domain }
+        val siteByDomain = HashMap<String, SiteRecord>(sites.size)
+        val catalogIndexByDomain = HashMap<String, Int>(sites.size)
+        sites.forEachIndexed { idx, s ->
+            siteByDomain[s.domain] = s
+            catalogIndexByDomain[s.domain] = idx
+        }
+
+        val allOk = rows.filterIsInstance<AccountResult.Ok>()
+        val allErr = rows.filterIsInstance<AccountResult.Err>()
+        val rawSignedInCount = allOk.size
+        val rawRejectedCount = allErr.size
+        val rawWithBalanceCount = allOk.count { SiteOrderUtil.effectiveCash(it) > 0.001 }
+        val rawNothingWaitingCount = allOk.count { !it.hasData }
+
+        fun matchesFilters(domain: String, ok: AccountResult.Ok?): Boolean {
+            val site = siteByDomain[domain]
+            if (prefs.mineOnly && site?.isMine != true) return false
+            if (prefs.notVisited && site?.isVisited == true) return false
+            if (prefs.signupOnly && !SiteOrderUtil.isLitBonus(ok?.newMember)) return false
+            return true
+        }
+
+        val sortableByDomain = HashMap<String, SiteOrderUtil.SortableEntry>(rows.size)
+        for (res in rows) {
+            val site = siteByDomain[res.domain]
+            val health = healthMap[res.domain]
+            sortableByDomain[res.domain] = SiteOrderUtil.SortableEntry(
+                domain = res.domain,
+                group = site?.group ?: SiteGroup.CUSTOM,
+                addedAt = site?.addedAt ?: "",
+                catalogIndex = catalogIndexByDomain[res.domain] ?: Int.MAX_VALUE,
+                result = res,
+                isDead = health?.status == SiteStatus.DEAD
+            )
+        }
+
+        val effectiveSort = prefs.sortMode
+        val valid = allOk
+            .filter { it.hasData && matchesFilters(it.domain, it) }
+            .sortedWith { a, b ->
+                SiteOrderUtil.compareEntries(
+                    sortableByDomain.getValue(a.domain),
+                    sortableByDomain.getValue(b.domain),
+                    effectiveSort,
+                    prefs.bonusMode
+                )
+            }
+        val empty = allOk
+            .filter { !it.hasData && matchesFilters(it.domain, it) }
+            .sortedWith { a, b ->
+                SiteOrderUtil.compareEntries(
+                    sortableByDomain.getValue(a.domain),
+                    sortableByDomain.getValue(b.domain),
+                    effectiveSort,
+                    prefs.bonusMode
+                )
+            }
+        val rejected = allErr.sortedWith { a, b ->
+            SiteOrderUtil.compareEntries(
+                sortableByDomain.getValue(a.domain),
+                sortableByDomain.getValue(b.domain),
+                effectiveSort,
+                prefs.bonusMode
+            )
+        }
+
+        fun buildFetcherItems(list: List<AccountResult.Ok>, startRank: Int): List<DirectorySiteItem> =
+            list.mapIndexed { idx, ok ->
+                val site = siteByDomain[ok.domain] ?: SiteRecord(
+                    domain = ok.domain,
+                    group = SiteGroup.CUSTOM,
+                    addedAt = "",
+                    isMine = true,
+                    isVisited = false,
+                    isHidden = false
+                )
+                val health = healthMap[ok.domain]
+                val status = health?.status ?: SiteStatus.LIVE
+                val chosen = if (prefs.bonusMode != BonusMode.NONE) ok.bonusFor(prefs.bonusMode) else null
+                DirectorySiteItem(
+                    rank = startRank + idx,
+                    site = site,
+                    relativeAge = FormatUtil.timeAgo(site.addedAt),
+                    status = status,
+                    latencyMs = ok.latencyMs.takeIf { it > 0L } ?: (health?.latencyMs ?: 0L),
+                    account = ok,
+                    errorRow = null,
+                    sameCasinoCount = sameCasinoMap[ok.domain] ?: 0,
+                    hasSignupBonus = SiteOrderUtil.isLitBonus(ok.newMember),
+                    hasReferlink = SiteOrderUtil.hasReferlink(ok),
+                    popularityScore = SiteOrderUtil.popularityScore(
+                        site.group,
+                        catalogIndexByDomain[ok.domain] ?: 0
+                    ),
+                    walletText = "${FormatUtil.money(SiteOrderUtil.effectiveCash(ok))} · ${ok.cashWalletName}",
+                    bonusText = chosen?.let { "${it.name} ${it.amountDisplay}" }
+                )
+            }
+
+        val validItems = buildFetcherItems(valid, 1)
+        val emptyItems = buildFetcherItems(empty, valid.size + 1)
 
         val knownCodes = setOf("blocked", "rate_limit", "timeout", "unreachable", "captcha", "invalid_login")
         val byCode = rejected.groupBy { err -> if (err.code in knownCodes) err.code else "other" }
@@ -455,7 +636,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val totalRetries = rows.sumOf { it.retriesUsed }
         val totalAttempts = rows.sumOf { it.attemptsUsed }
 
-        val effectiveWorkerLimit = if (running) limitW else prefs.fetchSpeedPreset.maxWorkers
+        val effectiveWorkerLimit = if (running) limitW else prefs.fetchSpeedPreset.coldLoginProfile.maxWorkers
 
         FetcherUiState(
             credentials = creds,
@@ -467,6 +648,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             activeWorkers = activeW,
             peakWorkers = peakW,
             workerLimit = effectiveWorkerLimit,
+            allowBackgroundRuns = prefs.allowBackgroundRuns,
             liveStatusLabel = liveLabel,
             wallElapsedSec = wallSec,
             signInElapsedSec = signInSec,
@@ -475,59 +657,128 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             statusMessage = statusMsg,
             validAccounts = valid,
             emptyAccounts = empty,
+            validItems = validItems,
+            emptyItems = emptyItems,
             rejectedAccounts = rejected,
             rejectedGroups = rejectedGroups,
             retryableDomains = retryable,
-            totalCash = valid.sumOf { it.cash },
+            totalCash = valid.sumOf { SiteOrderUtil.effectiveCash(it) },
+            rawSignedInCount = rawSignedInCount,
+            rawRejectedCount = rawRejectedCount,
+            rawWithBalanceCount = rawWithBalanceCount,
+            rawNothingWaitingCount = rawNothingWaitingCount,
+            sortMode = prefs.sortMode,
+            bonusMode = prefs.bonusMode,
+            cardColor = prefs.cardColor,
+            walletsMode = prefs.wallets,
+            notVisitedFilter = prefs.notVisited,
+            signupOnlyFilter = prefs.signupOnly,
+            mineOnlyFilter = prefs.mineOnly,
             fetchDiffs = diffs,
             showRejectedSites = showRej,
             mineTargetDomains = mineTargets,
             allTargetDomains = sites.map { it.domain },
             fetchRuns = runs,
-            viewingRunId = viewRunId
+            viewingRunId = viewRunId,
+            cooldownSeconds = cooldownSec,
+            cooldownReason = cooldownReason,
+            sessionReusedCount = reusedCount,
+            savedSessionDomains = savedSessionsMap.filterValues { it.hasToken }.keys
         )
     }
         .flowOn(Dispatchers.Default)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FetcherUiState())
 
-    // --- Module 3: Bonus Finder State ---
+    // --- Module 3: Bonus Finder State (Backed by Coordinator + Live Telemetry) ---
     val bonusFinderState: StateFlow<BonusFinderUiState> = combine(
         visibleSitesFlow,
         repository.publicBonusesFlow,
         _bonusSearch.debounce(120),
+        _bonusStatusFilter,
         _bonusSelectedSlots,
         _bonusListOrderSlot,
         _bonusAmountSort,
-        _bonusRunning,
-        _bonusProgress,
-        _bonusStatus
+        preferencesFlow,
+        bonusCheckpointFlow,
+        coordinator.bonusRunning,
+        coordinator.bonusProgress,
+        coordinator.bonusStatus,
+        coordinator.bonusLiveStatusLabel,
+        coordinator.bonusWallElapsedSec,
+        coordinator.bonusScanLatencyMs,
+        coordinator.bonusRetries,
+        coordinator.bonusAttempts,
+        coordinator.bonusRunLoaded,
+        coordinator.bonusRunFailed,
+        repository.engine.bonusActiveWorkers,
+        repository.engine.bonusPeakWorkers,
+        repository.engine.bonusCurrentWorkerLimit
     ) { arr ->
         @Suppress("UNCHECKED_CAST")
         val sites = arr[0] as List<SiteRecord>
         @Suppress("UNCHECKED_CAST")
         val cache = arr[1] as Map<String, PublicBonusSiteCache>
         val query = (arr[2] as String).trim().lowercase(Locale.US)
+        val statusFilter = arr[3] as BonusStatusFilter
         @Suppress("UNCHECKED_CAST")
-        val selectedSlots = arr[3] as Set<PublicBonusSlot>
-        val listOrderSlot = arr[4] as PublicBonusSlot?
-        val amountSort = arr[5] as BonusAmountSort
-        val running = arr[6] as Boolean
+        val selectedSlots = arr[4] as Set<PublicBonusSlot>
+        val listOrderSlot = arr[5] as PublicBonusSlot?
+        val amountSort = arr[6] as BonusAmountSort
+        val prefs = arr[7] as VaultPreferences
+        val bonusCheckpoint = arr[8] as FetchCheckpoint?
+        val running = arr[9] as Boolean
         @Suppress("UNCHECKED_CAST")
-        val progress = arr[7] as Pair<Int, Int>
-        val statusMsg = arr[8] as String
+        val progress = arr[10] as Pair<Int, Int>
+        val statusMsg = arr[11] as String
+        val liveLabel = arr[12] as String
+        val wallSec = arr[13] as Long
+        val scanLatencyMs = arr[14] as Long
+        val retries = arr[15] as Int
+        val attempts = arr[16] as Int
+        val runLoaded = arr[17] as Int
+        val runFailed = arr[18] as Int
+        val activeW = arr[19] as Int
+        val peakW = arr[20] as Int
+        val limitW = arr[21] as Int
 
         val domains = sites.map { it.domain }
-        var filtered = domains.filter { domain ->
+        val loadedDomains = ArrayList<String>()
+        val failedDomains = ArrayList<String>()
+        val unloadedDomains = ArrayList<String>()
+        var withOffersCount = 0
+
+        for (d in domains) {
+            val row = cache[d]
+            when {
+                row == null -> unloadedDomains.add(d)
+                row.ok -> {
+                    loadedDomains.add(d)
+                    if (row.bonuses.isNotEmpty()) withOffersCount++
+                }
+                else -> failedDomains.add(d)
+            }
+        }
+
+        // Apply status tab filter first
+        val byStatus = when (statusFilter) {
+            BonusStatusFilter.ALL -> domains
+            BonusStatusFilter.LOADED -> loadedDomains
+            BonusStatusFilter.FAILED -> failedDomains
+            BonusStatusFilter.UNLOADED -> unloadedDomains
+        }
+
+        var filtered = byStatus.filter { domain ->
             if (query.isEmpty()) return@filter true
             if (domain.contains(query)) return@filter true
             val cached = cache[domain]
-            cached?.bonuses?.any { it.name.lowercase(Locale.US).contains(query) } == true
+            cached?.bonuses?.any { it.name.lowercase(Locale.US).contains(query) } == true ||
+                cached?.errorMessage?.lowercase(Locale.US)?.contains(query) == true
         }
 
         if (selectedSlots.isNotEmpty()) {
             filtered = filtered.filter { domain ->
                 val row = cache[domain] ?: return@filter false
-                row.bonuses.any { it.slot != PublicBonusSlot.OTHER && selectedSlots.contains(it.slot) }
+                row.ok && row.bonuses.any { it.slot != PublicBonusSlot.OTHER && selectedSlots.contains(it.slot) }
             }
         }
 
@@ -555,7 +806,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
         val items = sorted.mapIndexed { idx, domain ->
             val row = cache[domain]
-            val bonuses = row?.bonuses.orEmpty()
+            val bonuses = if (row?.ok == true) row.bonuses else emptyList()
             BonusFinderItem(
                 domain = domain,
                 rank = idx + 1,
@@ -568,17 +819,41 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
+        val scanSec = (scanLatencyMs + 500L) / 1000L
+        val effectiveWorkerLimit = if (running) limitW else prefs.bonusSpeedPreset.bonusScanProfile.maxWorkers
+
         BonusFinderUiState(
             searchQuery = _bonusSearch.value,
+            statusFilter = statusFilter,
             selectedSlots = selectedSlots,
             listOrderSlot = listOrderSlot,
             amountSort = amountSort,
+            speedPreset = prefs.bonusSpeedPreset,
+            activeCheckpoint = bonusCheckpoint?.takeIf { it.remainingDomains.isNotEmpty() },
             items = items,
             totalDomains = domains.size,
-            loadedCount = domains.count { cache.containsKey(it) },
+            loadedCount = loadedDomains.size + failedDomains.size,
+            loadedTotalCount = loadedDomains.size,
+            failedTotalCount = failedDomains.size,
+            unloadedTotalCount = unloadedDomains.size,
+            withOffersCount = withOffersCount,
+            failedDomains = failedDomains,
+            unloadedDomains = unloadedDomains,
+            allTargetDomains = domains,
             isScanning = running,
             progressDone = progress.first,
             progressTotal = progress.second,
+            activeWorkers = activeW,
+            peakWorkers = peakW,
+            workerLimit = effectiveWorkerLimit,
+            allowBackgroundRuns = prefs.allowBackgroundRuns,
+            liveStatusLabel = liveLabel,
+            wallElapsedSec = wallSec,
+            scanElapsedSec = scanSec,
+            totalRetries = retries,
+            totalAttempts = attempts,
+            runLoadedCount = runLoaded,
+            runFailedCount = runFailed,
             statusMessage = statusMsg
         )
     }
@@ -596,6 +871,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         _intelStatusFilter,
         _intelSelectedDomains,
         _intelRunning,
+        _intelFetchingLatest,
         _intelProgress,
         _intelStatus
     ) { arr ->
@@ -610,9 +886,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         @Suppress("UNCHECKED_CAST")
         val selectedSet = arr[5] as Set<String>
         val running = arr[6] as Boolean
+        val fetchingLatest = arr[7] as Boolean
         @Suppress("UNCHECKED_CAST")
-        val progress = arr[7] as Pair<Int, Int>
-        val statusMsg = arr[8] as String
+        val progress = arr[8] as Pair<Int, Int>
+        val statusMsg = arr[9] as String
 
         var up = 0
         var slow = 0
@@ -659,6 +936,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             redirectCount = redirect,
             downCount = down,
             isChecking = running,
+            isFetchingLatestList = fetchingLatest,
             progressDone = progress.first,
             progressTotal = progress.second,
             statusMessage = statusMsg
@@ -669,67 +947,32 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
 
     val intelSearchInput: StateFlow<String> = _intelSearch.asStateFlow()
 
-    init {
-        refreshOutgoingIp()
-        viewModelScope.launch {
-            repository.ensureInitialized()
-            val savedCheckpoint = repository.checkpointFlow.first()
-            if (savedCheckpoint != null && savedCheckpoint.remainingDomains.isNotEmpty()) {
-                val partialRows = savedCheckpoint.partialRunId?.let { repository.loadRunResults(it) }
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: repository.loadLatestRunResults()
-                if (partialRows.isNotEmpty()) {
-                    _fetcherRows.value = partialRows
-                }
-                _fetcherProgress.value = savedCheckpoint.completedDomains.size to savedCheckpoint.allTargetDomains.size
-                _wallElapsedSec.value = savedCheckpoint.elapsedWallSec
-                _liveStatusLabel.value = if (savedCheckpoint.pauseReason == CheckpointPauseReason.WAF_BLOCKED) {
-                    "Paused (WAF)"
-                } else {
-                    "Paused"
-                }
-                _fetcherStatus.value = "Saved checkpoint: ${savedCheckpoint.completedDomains.size} of ${savedCheckpoint.allTargetDomains.size} processed · ${savedCheckpoint.remainingDomains.size} remaining."
-            } else {
-                val latestRows = repository.loadLatestRunResults()
-                if (latestRows.isNotEmpty()) {
-                    _fetcherRows.value = latestRows
-                    _fetcherProgress.value = latestRows.size to latestRows.size
-                    _liveStatusLabel.value = "Idle"
-                    val okCount = latestRows.count { it is AccountResult.Ok }
-                    _fetcherStatus.value = "Loaded last saved run ($okCount of ${latestRows.size} signed in)."
-                }
-            }
-        }
+    override fun onCleared() {
+        super.onCleared()
+        // If Background Runs is OFF, cleanly stop active runs (saving checkpoints) when the app is dismissed.
+        // If Background Runs is ON, leave coordinator + Foreground Service running uninterrupted.
+        coordinator.stopAllRunsForAppClose()
     }
 
-    fun refreshOutgoingIp() {
-        egressJob?.cancel()
-        egressJob = viewModelScope.launch {
-            _egressState.update { it.copy(isLoading = true, error = null) }
-            val result = repository.engine.lookupEgressInfo()
-            result.onSuccess { info ->
-                _egressState.value = EgressUiState(isLoading = false, info = info, error = null)
-            }.onFailure { err ->
-                _egressState.update { prev ->
-                    prev.copy(
-                        isLoading = false,
-                        error = err.message ?: "Unable to detect outgoing IP"
-                    )
-                }
-            }
-        }
-    }
+    fun refreshOutgoingIp() = coordinator.refreshOutgoingIp()
+
+    fun setAllowBackgroundRuns(enabled: Boolean) = coordinator.setAllowBackgroundRuns(enabled)
 
     // --- Modal & Detail Actions ---
     fun setAddDomainOpen(open: Boolean) = _modalState.update { it.copy(isAddDomainOpen = open) }
     fun setSortFilterOpen(open: Boolean) = _modalState.update { it.copy(isSortFilterOpen = open) }
+    fun setNotVisitedAuthAlertOpen(open: Boolean) = _modalState.update { it.copy(isNotVisitedAuthAlertOpen = open) }
     fun setConfirmScanOpen(open: Boolean) = _modalState.update { it.copy(isConfirmScanOpen = open) }
     fun setFetchHistoryOpen(open: Boolean) = _modalState.update { it.copy(isFetchHistoryOpen = open) }
     fun openSiteDetail(domain: String?) = _modalState.update { it.copy(selectedDetailDomain = domain) }
 
     fun getDetailForDomain(domain: String): DirectorySiteItem? {
         return directoryState.value.items.firstOrNull { it.site.domain == domain }
+            ?: fetcherState.value.validItems.firstOrNull { it.site.domain == domain }
+            ?: fetcherState.value.emptyItems.firstOrNull { it.site.domain == domain }
     }
+
+    fun hasSavedCredentials(): Boolean = credentialsFlow.value.validPairs().isNotEmpty()
 
     // --- Theme & Preferences ---
     fun selectTheme(themeId: VaultThemeId) {
@@ -741,7 +984,12 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun toggleNotVisited() {
-        viewModelScope.launch { repository.setNotVisited(!preferencesFlow.value.notVisited) }
+        val turningOn = !preferencesFlow.value.notVisited
+        if (turningOn && !hasSavedCredentials()) {
+            setNotVisitedAuthAlertOpen(true)
+            return
+        }
+        viewModelScope.launch { repository.setNotVisited(turningOn) }
     }
 
     fun toggleWallets() {
@@ -769,6 +1017,39 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.setBonusMode(mode) }
     }
 
+    fun setCardColor(color: CardColor) {
+        viewModelScope.launch { repository.setCardColor(color) }
+    }
+
+    fun applySortFilter(
+        sortMode: SortMode,
+        bonusMode: BonusMode,
+        notVisited: Boolean,
+        signupOnly: Boolean,
+        mineOnly: Boolean
+    ) {
+        val allowedNotVisited = if (notVisited && !hasSavedCredentials()) {
+            setNotVisitedAuthAlertOpen(true)
+            false
+        } else {
+            notVisited
+        }
+        viewModelScope.launch {
+            repository.applySortFilter(
+                sortMode = sortMode,
+                bonusMode = bonusMode,
+                notVisited = allowedNotVisited,
+                signupOnly = signupOnly,
+                mineOnly = mineOnly
+            )
+        }
+        setSortFilterOpen(false)
+    }
+
+    fun resetSortFilter() {
+        viewModelScope.launch { repository.resetSortFilter() }
+    }
+
     fun toggleMine(domain: String) {
         val currentlyMine = visibleSitesFlow.value.firstOrNull { it.domain == domain }?.isMine == true
         viewModelScope.launch { repository.toggleMine(domain, currentlyMine) }
@@ -787,7 +1068,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             repository.addDomains(listOf(normalized), markAsMine = markAsMine)
             onResult(null)
-            _snackbarEvents.tryEmit("Added $normalized to your vault.")
+            coordinator.emitMessage("Added $normalized to your vault.")
         }
     }
 
@@ -838,333 +1119,79 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Module 2: Paced Adaptive Account Fetcher + Checkpoints + WAF Auto-Pause ---
+    // --- Module 2: Account Fetcher Commands ---
     fun setFetchSpeedPreset(preset: FetchSpeedPreset) {
         viewModelScope.launch { repository.setFetchSpeedPreset(preset) }
     }
 
-    fun resumeCheckpoint() {
-        val cp = checkpointFlow.value
-        if (cp == null || cp.remainingDomains.isEmpty()) {
-            _snackbarEvents.tryEmit("No paused checkpoint to resume.")
-            return
-        }
-        startFetch(cp.remainingDomains, resumeCheckpoint = cp)
-    }
+    fun resumeCheckpoint() = coordinator.resumeCheckpoint()
 
-    fun discardCheckpoint() {
-        viewModelScope.launch {
-            repository.clearCheckpoint()
-            if (!_fetcherRunning.value) {
-                _liveStatusLabel.value = "Idle"
-                _fetcherStatus.value = "Checkpoint cleared. Ready for a new fetch."
-            }
-            _snackbarEvents.tryEmit("Saved checkpoint discarded.")
-        }
-    }
+    fun discardCheckpoint() = coordinator.discardCheckpoint()
 
     fun retryRejectedCode(code: String) {
         val group = fetcherState.value.rejectedGroups.firstOrNull { it.code == code }
         val domains = group?.rows?.map { it.domain }.orEmpty()
         if (domains.isEmpty()) {
-            _snackbarEvents.tryEmit("No sites in that category to retry.")
+            coordinator.emitMessage("No sites in that category to retry.")
             return
         }
-        startFetch(domains)
+        coordinator.startFetch(domains)
     }
 
     fun startFetch(
         domainsToFetch: List<String>,
         resumeCheckpoint: FetchCheckpoint? = null
-    ) {
-        val creds = credentialsFlow.value.validPairs()
-        if (creds.isEmpty()) {
-            _fetcherStatus.value = "Enter your phone number and password before fetching."
-            return
-        }
-
-        val allTargetDomains: List<String>
-        val dispatchDomains: List<String>
-        if (resumeCheckpoint != null) {
-            allTargetDomains = resumeCheckpoint.allTargetDomains.distinct()
-            dispatchDomains = resumeCheckpoint.remainingDomains
-                .map { DomainUtil.normalizeDomain(it) }
-                .filter { DomainUtil.isPublicDomain(it) }
-                .distinct()
-        } else {
-            val normalized = domainsToFetch
-                .map { DomainUtil.normalizeDomain(it) }
-                .filter { DomainUtil.isPublicDomain(it) }
-                .distinct()
-            allTargetDomains = normalized
-            dispatchDomains = normalized
-        }
-
-        if (dispatchDomains.isEmpty()) {
-            _fetcherStatus.value = "No sites selected. Bookmark accounts, enter a domain, or run a full scan."
-            return
-        }
-
-        fetchJob?.cancel()
-        wallTimerJob?.cancel()
-        fetchJob = viewModelScope.launch {
-            val preset = preferencesFlow.value.fetchSpeedPreset
-            val runStartedAt = resumeCheckpoint?.runStartedAt ?: System.currentTimeMillis()
-            val segmentStartedAt = System.currentTimeMillis()
-            val baseElapsedWallSec = resumeCheckpoint?.elapsedWallSec ?: 0L
-            val previousOkMap = latestAccountsFlow.value
-            val hostCache = repository.loadHostCacheMap()
-
-            // Seed prior results when resuming from a checkpoint
-            val collectedMap = LinkedHashMap<String, AccountResult>(allTargetDomains.size)
-            if (resumeCheckpoint != null) {
-                val priorRows = resumeCheckpoint.partialRunId?.let { repository.loadRunResults(it) }
-                    ?.takeIf { it.isNotEmpty() }
-                    ?: _fetcherRows.value
-                val dispatchSet = dispatchDomains.toSet()
-                val targetSet = allTargetDomains.toSet()
-                for (row in priorRows) {
-                    if (row.domain in targetSet && row.domain !in dispatchSet) {
-                        collectedMap[row.domain] = row
-                    }
-                }
-            } else if (allTargetDomains.size > 1) {
-                repository.clearCheckpoint()
-            }
-
-            _fetcherRunning.value = true
-            _viewingRunId.value = null
-            _fetcherProgress.value = collectedMap.size to allTargetDomains.size
-            _fetcherRows.value = collectedMap.values.toList()
-            _fetcherDiffs.value = emptyList()
-            _showRejected.value = false
-            _wallElapsedSec.value = baseElapsedWallSec
-            _liveStatusLabel.value = "Running (${preset.displayName})…"
-            _fetcherStatus.value = when {
-                resumeCheckpoint != null ->
-                    "Resuming ${dispatchDomains.size} remaining sites (${preset.displayName}: ${preset.subtitle})…"
-                dispatchDomains.size == 1 ->
-                    "Checking ${dispatchDomains.first()}…"
-                else ->
-                    "${preset.displayName} mode checking ${dispatchDomains.size} sites (${preset.subtitle})…"
-            }
-
-            wallTimerJob = viewModelScope.launch {
-                while (isActive) {
-                    delay(1000L)
-                    val segSec = (System.currentTimeMillis() - segmentStartedAt) / 1000L
-                    _wallElapsedSec.value = baseElapsedWallSec + segSec
-                }
-            }
-
-            var lastUiPush = 0L
-            var sinceLastCheckpoint = 0
-            var sinceLastRoomFlush = 0
-            var latestPartialRunId: Long? = resumeCheckpoint?.partialRunId
-
-            try {
-                val report = repository.engine.fetchAccountsBatch(
-                    domains = dispatchDomains,
-                    credentials = creds,
-                    hostCache = hostCache,
-                    preset = preset,
-                    onHostDiscovered = { target -> repository.saveHostTarget(target) },
-                    onResult = { res ->
-                        collectedMap[res.domain] = res
-                        sinceLastCheckpoint++
-                        sinceLastRoomFlush++
-                        val now = System.currentTimeMillis()
-                        if (now - lastUiPush >= 120L || collectedMap.size >= allTargetDomains.size) {
-                            lastUiPush = now
-                            _fetcherProgress.value = collectedMap.size to allTargetDomains.size
-                            _fetcherRows.value = collectedMap.values.toList()
-                        }
-
-                        // Periodic durable checkpoint during large scans (>25 sites)
-                        if (allTargetDomains.size > 25 && sinceLastCheckpoint >= 15) {
-                            sinceLastCheckpoint = 0
-                            val snapshotList = collectedMap.values.toList()
-                            if (sinceLastRoomFlush >= 60) {
-                                sinceLastRoomFlush = 0
-                                latestPartialRunId = repository.persistFetchRun(
-                                    runStartedAt,
-                                    allTargetDomains.size,
-                                    snapshotList
-                                )
-                            }
-                            val doneDomains = collectedMap.keys.toList()
-                            val remaining = allTargetDomains.filter { !collectedMap.containsKey(it) }
-                            if (remaining.isNotEmpty()) {
-                                val elapsedSec = baseElapsedWallSec + (now - segmentStartedAt) / 1000L
-                                repository.saveCheckpoint(
-                                    FetchCheckpoint(
-                                        runStartedAt = runStartedAt,
-                                        allTargetDomains = allTargetDomains,
-                                        completedDomains = doneDomains,
-                                        remainingDomains = remaining,
-                                        pauseReason = CheckpointPauseReason.INTERRUPTED,
-                                        pausedAtIp = _egressState.value.info?.ip,
-                                        pauseDetail = "In-progress checkpoint",
-                                        elapsedWallSec = elapsedSec,
-                                        partialRunId = latestPartialRunId,
-                                        savedAt = now
-                                    )
-                                )
-                            }
-                        }
-                    }
-                )
-
-                val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
-                val totalWallSec = (totalWallMs + 500L) / 1000L
-                _wallElapsedSec.value = totalWallSec
-
-                if (report.wasCircuitBroken) {
-                    val trippedSet = report.trippedDomains.toSet()
-                    val finalPartialRows = collectedMap.values.toList()
-                    val partialRunId = if (finalPartialRows.isNotEmpty()) {
-                        repository.persistFetchRun(runStartedAt, allTargetDomains.size, finalPartialRows)
-                    } else {
-                        latestPartialRunId
-                    }
-
-                    val completedClean = collectedMap.keys.filter { it !in trippedSet }
-                    val unstarted = dispatchDomains.filter { !collectedMap.containsKey(it) }
-                    val remaining = (report.trippedDomains + unstarted).distinct()
-
-                    val checkpoint = FetchCheckpoint(
-                        runStartedAt = runStartedAt,
-                        allTargetDomains = allTargetDomains,
-                        completedDomains = completedClean,
-                        remainingDomains = remaining,
-                        pauseReason = CheckpointPauseReason.WAF_BLOCKED,
-                        pausedAtIp = _egressState.value.info?.ip,
-                        pauseDetail = report.pauseDetail.ifBlank { "Burst of firewall / rate-limit blocks detected" },
-                        elapsedWallSec = totalWallSec,
-                        partialRunId = partialRunId,
-                        savedAt = System.currentTimeMillis()
-                    )
-                    repository.saveCheckpoint(checkpoint)
-
-                    _viewingRunId.value = partialRunId
-                    _fetcherRows.value = finalPartialRows
-                    _fetcherProgress.value = completedClean.size to allTargetDomains.size
-                    _liveStatusLabel.value = "Paused (WAF)"
-                    _fetcherStatus.value = "Auto-paused to protect your IP (${report.pauseDetail}). ${remaining.size} sites queued to resume."
-                    _snackbarEvents.tryEmit("Auto-paused: rate-limit / firewall block detected. Wait or switch network before resuming.")
-                } else {
-                    val finalRows = collectedMap.values.toList()
-                    repository.clearCheckpoint()
-                    val runId = repository.persistFetchRun(runStartedAt, allTargetDomains.size, finalRows)
-                    _viewingRunId.value = runId
-                    _fetcherRows.value = finalRows
-                    _fetcherProgress.value = finalRows.size to allTargetDomains.size
-
-                    val diffs = buildList {
-                        for (r in finalRows) {
-                            if (r is AccountResult.Ok) {
-                                val prev = previousOkMap[r.domain]
-                                if (prev != null && abs(prev.cash - r.cash) >= 0.01) {
-                                    add("${r.domain}: ${FormatUtil.money(prev.cash)} → ${FormatUtil.money(r.cash)}")
-                                }
-                            }
-                        }
-                    }
-                    _fetcherDiffs.value = diffs
-                    val okCount = finalRows.count { it is AccountResult.Ok }
-                    val elapsedSec = totalWallMs / 1000.0
-                    _liveStatusLabel.value = "Done"
-                    _fetcherStatus.value = String.format(
-                        Locale.US,
-                        "Completed in %.1fs · %d of %d signed in · saved to vault.",
-                        elapsedSec,
-                        okCount,
-                        finalRows.size
-                    )
-                }
-            } catch (_: CancellationException) {
-                val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
-                val totalWallSec = (totalWallMs + 500L) / 1000L
-                _wallElapsedSec.value = totalWallSec
-                val partial = collectedMap.values.toList()
-                val partialRunId = if (partial.isNotEmpty()) {
-                    repository.persistFetchRun(runStartedAt, allTargetDomains.size, partial)
-                } else {
-                    latestPartialRunId
-                }
-                if (partial.isNotEmpty()) {
-                    _fetcherRows.value = partial
-                    _fetcherProgress.value = partial.size to allTargetDomains.size
-                }
-                val remaining = allTargetDomains.filter { !collectedMap.containsKey(it) }
-                if (remaining.isNotEmpty() && allTargetDomains.size > 1) {
-                    repository.saveCheckpoint(
-                        FetchCheckpoint(
-                            runStartedAt = runStartedAt,
-                            allTargetDomains = allTargetDomains,
-                            completedDomains = collectedMap.keys.toList(),
-                            remainingDomains = remaining,
-                            pauseReason = CheckpointPauseReason.USER_STOPPED,
-                            pausedAtIp = _egressState.value.info?.ip,
-                            pauseDetail = "Paused by you",
-                            elapsedWallSec = totalWallSec,
-                            partialRunId = partialRunId,
-                            savedAt = System.currentTimeMillis()
-                        )
-                    )
-                    _liveStatusLabel.value = "Paused"
-                    _fetcherStatus.value = "Paused. ${partial.size} of ${allTargetDomains.size} saved · ${remaining.size} remaining."
-                } else {
-                    _liveStatusLabel.value = "Stopped"
-                    _fetcherStatus.value = "Stopped. ${partial.count { it is AccountResult.Ok }} completed hits were saved."
-                }
-            } finally {
-                wallTimerJob?.cancel()
-                wallTimerJob = null
-                _fetcherRunning.value = false
-            }
-        }
-    }
+    ) = coordinator.startFetch(domainsToFetch, resumeCheckpoint)
 
     fun retryFailedFetches() {
         val retryTargets = fetcherState.value.retryableDomains
         if (retryTargets.isEmpty()) {
-            _snackbarEvents.tryEmit("No recoverable failures in this run.")
+            coordinator.emitMessage("No recoverable failures in this run.")
             return
         }
-        startFetch(retryTargets)
+        coordinator.startFetch(retryTargets)
     }
 
-    fun stopFetch() {
-        fetchJob?.cancel()
-    }
+    fun stopFetch() = coordinator.stopFetch()
 
-    fun setShowRejectedSites(show: Boolean) {
-        _showRejected.value = show
-    }
+    fun setShowRejectedSites(show: Boolean) = coordinator.setShowRejectedSites(show)
 
     fun loadHistoricalRun(runId: Long) {
-        viewModelScope.launch {
-            val rows = repository.loadRunResults(runId)
-            val runSummary = fetcherState.value.fetchRuns.firstOrNull { it.runId == runId }
-            _fetcherRows.value = rows
-            _fetcherProgress.value = rows.size to (runSummary?.targetCount ?: rows.size)
-            _wallElapsedSec.value = if (runSummary != null && runSummary.completedAt > runSummary.startedAt) {
-                (runSummary.completedAt - runSummary.startedAt + 500L) / 1000L
-            } else {
-                0L
-            }
-            _liveStatusLabel.value = "Saved run"
-            _viewingRunId.value = runId
-            _fetcherDiffs.value = emptyList()
-            _fetcherStatus.value = "Viewing saved run (${rows.count { it is AccountResult.Ok }} of ${rows.size} signed in)."
-            setFetchHistoryOpen(false)
-        }
+        val runSummary = fetcherState.value.fetchRuns.firstOrNull { it.runId == runId }
+        coordinator.loadHistoricalRun(runId, runSummary)
+        setFetchHistoryOpen(false)
     }
 
-    // --- Module 3: Bonus Finder Actions ---
+    fun openCaptchaSignIn(domain: String) {
+        _captchaSignInDomain.value = DomainUtil.normalizeDomain(domain)
+    }
+
+    fun dismissCaptchaSignIn() {
+        _captchaSignInDomain.value = null
+    }
+
+    fun completeCaptchaSignIn(
+        domain: String,
+        accessId: String,
+        accessToken: String,
+        host: String = "",
+        merchantId: String = ""
+    ) {
+        _captchaSignInDomain.value = null
+        coordinator.completeCaptchaSignIn(domain, accessId, accessToken, host, merchantId)
+    }
+
+    // --- Module 3: Bonus Finder Commands ---
     fun onBonusSearchChanged(query: String) {
         _bonusSearch.value = query
+    }
+
+    fun setBonusStatusFilter(filter: BonusStatusFilter) {
+        _bonusStatusFilter.value = filter
+    }
+
+    fun setBonusSpeedPreset(preset: FetchSpeedPreset) {
+        viewModelScope.launch { repository.setBonusSpeedPreset(preset) }
     }
 
     fun toggleBonusSlotFilter(slot: PublicBonusSlot) {
@@ -1182,6 +1209,7 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearBonusFilters() {
+        _bonusStatusFilter.value = BonusStatusFilter.ALL
         _bonusSelectedSlots.value = emptySet()
         _bonusListOrderSlot.value = null
         _bonusAmountSort.value = BonusAmountSort.DOMAIN_AZ
@@ -1189,40 +1217,28 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun scanPublicBonuses(domains: List<String>) {
-        val unique = domains.distinct()
-        if (unique.isEmpty()) {
-            _bonusStatus.value = "No domains to scan."
+        coordinator.startBonusScan(domains)
+    }
+
+    fun resumeBonusCheckpoint() {
+        coordinator.resumeBonusCheckpoint()
+    }
+
+    fun discardBonusCheckpoint() {
+        coordinator.discardBonusCheckpoint()
+    }
+
+    fun retryFailedBonuses() {
+        val failed = bonusFinderState.value.failedDomains
+        if (failed.isEmpty()) {
+            coordinator.emitMessage("No failed domains to retry.")
             return
         }
-        bonusScanJob?.cancel()
-        bonusScanJob = viewModelScope.launch {
-            val hostCache = repository.loadHostCacheMap()
-            _bonusRunning.value = true
-            _bonusProgress.value = 0 to unique.size
-            _bonusStatus.value = "Scanning public offers across ${unique.size} domains…"
-            var done = 0
-            try {
-                repository.engine.scanPublicBonusesBatch(
-                    domains = unique,
-                    hostCache = hostCache,
-                    onHostDiscovered = { target -> repository.saveHostTarget(target) },
-                    onResult = { result ->
-                        repository.savePublicBonusResult(result)
-                        done++
-                        _bonusProgress.value = done to unique.size
-                    }
-                )
-                _bonusStatus.value = "Public promotions updated ($done scanned). No password was sent."
-            } catch (_: CancellationException) {
-                _bonusStatus.value = "Bonus scan stopped ($done / ${unique.size} saved)."
-            } finally {
-                _bonusRunning.value = false
-            }
-        }
+        coordinator.startBonusScan(failed)
     }
 
     fun stopBonusScan() {
-        bonusScanJob?.cancel()
+        coordinator.stopBonusScan()
     }
 
     // --- Module 4: Domain Intel Actions ---
@@ -1256,20 +1272,47 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             repository.hideDomains(toRemove)
             _intelSelectedDomains.value = emptySet()
             _intelStatus.value = "Removed ${toRemove.size} domain(s) from Directory, Fetcher, and Bonus Finder."
-            _snackbarEvents.tryEmit("Removed ${toRemove.size} domain(s).")
+            coordinator.emitMessage("Removed ${toRemove.size} domain(s).")
         }
     }
 
-    fun importDomainsText(rawText: String) {
+    fun importDomainsText(rawText: String, onFinished: (() -> Unit)? = null) {
         val domains = DomainUtil.extractDomainsFromText(rawText)
         if (domains.isEmpty()) {
-            _snackbarEvents.tryEmit("No valid domains found. Use one domain per line.")
+            _intelStatus.value = "No valid domains found in list."
+            coordinator.emitMessage("No valid domains found. Use one domain per line.")
+            onFinished?.invoke()
             return
         }
         viewModelScope.launch {
-            val added = repository.addDomains(domains, markAsMine = false)
-            _intelStatus.value = "Imported $added new domain(s) from ${domains.size} valid entries."
-            _snackbarEvents.tryEmit("Imported $added new domain(s).")
+            try {
+                val added = repository.addDomains(domains, markAsMine = false)
+                _intelStatus.value = "Processed ${domains.size} domain(s) · added $added new domain(s)."
+                coordinator.emitMessage("Added $added new domain(s) (${domains.size} processed).")
+            } finally {
+                onFinished?.invoke()
+            }
+        }
+    }
+
+    fun addLatestDomainsList() {
+        if (_intelFetchingLatest.value) return
+        intelLatestFetchJob?.cancel()
+        intelLatestFetchJob = viewModelScope.launch {
+            _intelFetchingLatest.value = true
+            _intelStatus.value = "Fetching latest domain list…"
+            val result = repository.engine.fetchLatestDomainsList()
+            result.onSuccess { extractedDomains ->
+                val onePerLineText = extractedDomains.joinToString("\n")
+                importDomainsText(onePerLineText) {
+                    _intelFetchingLatest.value = false
+                }
+            }.onFailure { err ->
+                _intelFetchingLatest.value = false
+                val msg = err.message?.takeIf { it.isNotBlank() } ?: "Could not load latest domain list."
+                _intelStatus.value = "Latest list error: $msg"
+                coordinator.emitMessage("Failed to load latest list: $msg")
+            }
         }
     }
 
@@ -1339,31 +1382,24 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
     fun restoreHiddenDomains() {
         viewModelScope.launch {
             repository.restoreHiddenDomains()
-            _snackbarEvents.tryEmit("Restored all hidden domains.")
+            coordinator.emitMessage("Restored all hidden domains.")
         }
     }
 
     fun clearVolatileCaches() {
         viewModelScope.launch {
             repository.clearVolatileCaches()
-            _snackbarEvents.tryEmit("Cleared host, health, and public bonus caches.")
+            coordinator.emitMessage("Cleared host, health, and public bonus caches.")
         }
     }
 
     fun clearAllDeviceData() {
-        fetchJob?.cancel()
-        wallTimerJob?.cancel()
-        bonusScanJob?.cancel()
         intelCheckJob?.cancel()
+        coordinator.resetAfterClearAll()
         viewModelScope.launch {
             repository.clearAllDeviceData()
-            _fetcherRows.value = emptyList()
-            _fetcherProgress.value = 0 to 0
-            _wallElapsedSec.value = 0L
-            _liveStatusLabel.value = "Idle"
-            _fetcherDiffs.value = emptyList()
             _intelSelectedDomains.value = emptySet()
-            _snackbarEvents.tryEmit("Cleared all local vault data.")
+            coordinator.emitMessage("Cleared all local vault data.")
         }
     }
 
@@ -1375,18 +1411,15 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val result = repository.importVaultJson(rawJson)
             result.onSuccess { msg ->
-                val latestRows = repository.loadLatestRunResults()
-                if (latestRows.isNotEmpty()) _fetcherRows.value = latestRows
-                _snackbarEvents.tryEmit(msg)
+                coordinator.reloadLatestRunRows()
+                coordinator.emitMessage(msg)
             }.onFailure { err ->
-                _snackbarEvents.tryEmit(err.message ?: "Could not import backup.")
+                coordinator.emitMessage(err.message ?: "Could not import backup.")
             }
         }
     }
 
-    fun emitMessage(msg: String) {
-        _snackbarEvents.tryEmit(msg)
-    }
+    fun emitMessage(msg: String) = coordinator.emitMessage(msg)
 
     // --- Pure Helper Math for Bonus Finder ---
     private fun publicBonusRank(bonus: PublicBonus): Double = when (bonus.kind) {
