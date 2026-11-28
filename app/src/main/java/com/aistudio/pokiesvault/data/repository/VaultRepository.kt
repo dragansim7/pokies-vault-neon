@@ -327,16 +327,19 @@ class VaultRepository(private val context: Context) {
     suspend fun setFetchSpeedPreset(preset: FetchSpeedPreset) = prefsStore.setFetchSpeedPreset(preset)
     suspend fun setBonusSpeedPreset(preset: FetchSpeedPreset) = prefsStore.setBonusSpeedPreset(preset)
     suspend fun setAllowBackgroundRuns(enabled: Boolean) = prefsStore.setAllowBackgroundRuns(enabled)
+    suspend fun setSkipKnownDead(enabled: Boolean) = prefsStore.setSkipKnownDead(enabled)
     suspend fun saveCheckpoint(checkpoint: FetchCheckpoint) = prefsStore.saveCheckpoint(checkpoint)
     suspend fun clearCheckpoint() = prefsStore.clearCheckpoint()
     suspend fun saveBonusCheckpoint(checkpoint: FetchCheckpoint) = prefsStore.saveBonusCheckpoint(checkpoint)
     suspend fun clearBonusCheckpoint() = prefsStore.clearBonusCheckpoint()
     suspend fun saveCredentials(credentials: VaultCredentials) = prefsStore.saveCredentials(credentials)
     suspend fun loadDomainSessionsMap(): Map<String, SavedDomainSession> = prefsStore.domainSessionsFlow.first()
+    suspend fun loadDomainHealthMap(): Map<String, DomainHealthRecord> = domainHealthFlow.first()
     suspend fun saveDomainSession(session: SavedDomainSession) = prefsStore.saveDomainSession(session)
     suspend fun saveDomainSessionsBatch(updates: Map<String, SavedDomainSession>) =
         prefsStore.saveDomainSessionsBatch(updates)
     suspend fun clearDomainToken(domain: String) = prefsStore.clearDomainToken(domain)
+    suspend fun clearDomainTokensBatch(domains: Collection<String>) = prefsStore.clearDomainTokensBatch(domains)
 
     suspend fun syncWithCapturedSession(
         rawDomain: String,

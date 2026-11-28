@@ -4,8 +4,10 @@ import com.aistudio.pokiesvault.data.local.HostCacheEntity
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.EgressIpInfo
+import com.aistudio.pokiesvault.data.model.FetchActiveLane
 import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
 import com.aistudio.pokiesvault.data.model.SavedDomainSession
+import com.aistudio.pokiesvault.data.model.SiteStatus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -46,7 +48,7 @@ class ConcurrentFetchEngine(
 ) {
     private val adaptiveController = AdaptiveConcurrencyController(minLimit = 6, initialLimit = 6, maxLimit = 8)
     private val bonusAdaptiveController = AdaptiveConcurrencyController(minLimit = 8, initialLimit = 8, maxLimit = 12)
-    private val statusProbeSemaphore = Semaphore(permits = 6)
+    private val statusProbeSemaphore = Semaphore(permits = 14)
     private val dnsResolveSemaphore = Semaphore(permits = 56)
 
     val currentWorkerLimit: StateFlow<Int> = adaptiveController.currentLimit
@@ -131,6 +133,7 @@ class ConcurrentFetchEngine(
         onSessionExpired: suspend (String) -> Unit = {},
         onSessionReused: () -> Unit = {},
         onCooldownChanged: (remainingSec: Int, reason: String) -> Unit = { _, _ -> },
+        onLaneChanged: (FetchActiveLane) -> Unit = {},
         onResult: suspend (AccountResult) -> Unit
     ): FetchBatchReport = coroutineScope {
         if (domains.isEmpty()) return@coroutineScope FetchBatchReport()
@@ -434,6 +437,7 @@ class ConcurrentFetchEngine(
         }
 
         try {
+            onLaneChanged(FetchActiveLane.DNS_CLUSTERING)
             val originPlan = resolveOriginsPlan(domains)
 
             // Fast-skip dead-DNS hosts immediately without consuming worker slots
@@ -469,6 +473,7 @@ class ConcurrentFetchEngine(
 
             // --- LANE A: Saved Session Fast Sweep (/users/syncData) ---
             if (savedSessionDomains.isNotEmpty() && !breakerTripped.get()) {
+                onLaneChanged(FetchActiveLane.SAVED_FAST)
                 ranSavedLane = true
                 val savedProfile = preset.savedSessionProfile
                 adaptiveController.reset(
@@ -539,6 +544,7 @@ class ConcurrentFetchEngine(
             }
 
             if (phase2Domains.isNotEmpty() && !breakerTripped.get()) {
+                onLaneChanged(FetchActiveLane.COLD_LOGIN)
                 val coldProfile = preset.coldLoginProfile
                 adaptiveController.reset(
                     min = coldProfile.minWorkers,
@@ -590,6 +596,7 @@ class ConcurrentFetchEngine(
         } catch (e: CancellationException) {
             throw e
         } finally {
+            onLaneChanged(FetchActiveLane.IDLE)
             onCooldownChanged(0, "")
             resultChannel.close()
             collectorJob.join()
@@ -829,13 +836,34 @@ class ConcurrentFetchEngine(
     }
 
     /**
-     * Probes domain statuses directly with bounded concurrency (max 6).
+     * Probes domain statuses directly with bounded concurrency (max 14) and fast-skips
+     * NXDOMAIN hosts via parallel DNS pre-pass so dead domains resolve immediately.
      */
     suspend fun probeDomainsBatch(
         domains: List<String>,
         onRecord: suspend (DomainHealthRecord) -> Unit
     ) = coroutineScope {
-        val jobs = domains.map { domain ->
+        if (domains.isEmpty()) return@coroutineScope
+        val toProbe = if (domains.size > 10) {
+            val plan = resolveOriginsPlan(domains)
+            if (plan.deadDnsDomains.isNotEmpty()) {
+                val now = System.currentTimeMillis()
+                for (dead in plan.deadDnsDomains) {
+                    onRecord(
+                        DomainHealthRecord(
+                            domain = dead,
+                            status = SiteStatus.DEAD,
+                            latencyMs = 1L,
+                            checkedAt = now
+                        )
+                    )
+                }
+            }
+            plan.liveDomains
+        } else {
+            domains
+        }
+        val jobs = toProbe.map { domain ->
             async(Dispatchers.IO) {
                 statusProbeSemaphore.withPermit {
                     val record = apiService.checkSiteStatus(domain)

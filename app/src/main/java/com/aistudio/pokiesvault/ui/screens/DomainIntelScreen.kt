@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
@@ -387,6 +388,32 @@ fun DomainIntelScreen(
                                         color = if (state.selectedDomains.isNotEmpty()) palette.dead else MaterialTheme.colorScheme.onSurfaceVariant
                                     )
                                 }
+                            }
+                        }
+
+                        if (!state.isChecking && state.downCount > 0) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedButton(
+                                onClick = { viewModel.hideDeadIntelDomains() },
+                                border = BorderStroke(1.dp, palette.dead.copy(alpha = 0.72f)),
+                                shape = MaterialTheme.shapes.small,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .testTag("intel_hide_dead_btn")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.VisibilityOff,
+                                    contentDescription = null,
+                                    tint = palette.dead,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = stringResource(R.string.hide_dead_domains_fmt, state.downCount),
+                                    color = palette.dead,
+                                    fontWeight = FontWeight.Bold
+                                )
                             }
                         }
 

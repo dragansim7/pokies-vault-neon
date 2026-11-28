@@ -48,6 +48,7 @@ class VaultPreferencesStore(private val context: Context) {
         val FETCH_SPEED_PRESET = stringPreferencesKey("fetch_speed_preset")
         val BONUS_SPEED_PRESET = stringPreferencesKey("bonus_speed_preset")
         val ALLOW_BACKGROUND_RUNS = booleanPreferencesKey("allow_background_runs")
+        val SKIP_KNOWN_DEAD = booleanPreferencesKey("skip_known_dead")
         val FETCH_CHECKPOINT_JSON = stringPreferencesKey("fetch_checkpoint_json_v1")
         val BONUS_CHECKPOINT_JSON = stringPreferencesKey("bonus_checkpoint_json_v1")
         val ENCRYPTED_CREDS = stringPreferencesKey("encrypted_credentials_v1")
@@ -71,7 +72,8 @@ class VaultPreferencesStore(private val context: Context) {
                 mineOnly = prefs[Keys.MINE_ONLY] ?: false,
                 fetchSpeedPreset = enumOrDefault(prefs[Keys.FETCH_SPEED_PRESET], FetchSpeedPreset.SAFE),
                 bonusSpeedPreset = enumOrDefault(prefs[Keys.BONUS_SPEED_PRESET], FetchSpeedPreset.SAFE),
-                allowBackgroundRuns = prefs[Keys.ALLOW_BACKGROUND_RUNS] ?: false
+                allowBackgroundRuns = prefs[Keys.ALLOW_BACKGROUND_RUNS] ?: false,
+                skipKnownDead = prefs[Keys.SKIP_KNOWN_DEAD] ?: false
             )
         }
 
@@ -220,6 +222,10 @@ class VaultPreferencesStore(private val context: Context) {
         context.vaultDataStore.edit { it[Keys.ALLOW_BACKGROUND_RUNS] = enabled }
     }
 
+    suspend fun setSkipKnownDead(enabled: Boolean) {
+        context.vaultDataStore.edit { it[Keys.SKIP_KNOWN_DEAD] = enabled }
+    }
+
     suspend fun saveCheckpoint(checkpoint: FetchCheckpoint) {
         val encoded = json.encodeToString(checkpoint)
         context.vaultDataStore.edit { it[Keys.FETCH_CHECKPOINT_JSON] = encoded }
@@ -282,18 +288,32 @@ class VaultPreferencesStore(private val context: Context) {
     suspend fun clearDomainToken(domain: String) {
         val key = domain.trim().lowercase()
         if (key.isBlank()) return
+        clearDomainTokensBatch(listOf(key))
+    }
+
+    suspend fun clearDomainTokensBatch(domains: Collection<String>) {
+        if (domains.isEmpty()) return
+        val normalizedKeys = domains.map { it.trim().lowercase() }.filter { it.isNotBlank() }.distinct()
+        if (normalizedKeys.isEmpty()) return
         context.vaultDataStore.edit { prefs ->
             val current = decodeSessionsMap(prefs[Keys.ENCRYPTED_DOMAIN_SESSIONS]).toMutableMap()
-            val prev = current[key] ?: return@edit
-            if (prev.winningPhone.isBlank()) {
-                current.remove(key)
-            } else {
-                current[key] = prev.copy(
-                    accessId = "",
-                    accessToken = "",
-                    updatedAt = System.currentTimeMillis()
-                )
+            var changed = false
+            val now = System.currentTimeMillis()
+            for (key in normalizedKeys) {
+                val prev = current[key] ?: continue
+                if (prev.winningPhone.isBlank()) {
+                    current.remove(key)
+                    changed = true
+                } else if (prev.accessId.isNotEmpty() || prev.accessToken.isNotEmpty()) {
+                    current[key] = prev.copy(
+                        accessId = "",
+                        accessToken = "",
+                        updatedAt = now
+                    )
+                    changed = true
+                }
             }
+            if (!changed) return@edit
             if (current.isEmpty()) {
                 prefs.remove(Keys.ENCRYPTED_DOMAIN_SESSIONS)
             } else {

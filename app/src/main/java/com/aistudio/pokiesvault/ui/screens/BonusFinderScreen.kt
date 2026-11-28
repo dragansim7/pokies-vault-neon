@@ -45,6 +45,8 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -205,6 +207,43 @@ fun BonusFinderScreen(
                             tagPrefix = "bonus_speed_preset",
                             mode = SpeedSelectorMode.BONUS_FINDER
                         )
+
+                        // Smart Filter: Skip known dead domains from Domain Intel
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = if (state.knownDeadCount > 0) {
+                                        "${stringResource(R.string.skip_known_dead_label)} (${state.knownDeadCount})"
+                                    } else {
+                                        stringResource(R.string.skip_known_dead_label)
+                                    },
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    style = MaterialTheme.typography.labelLarge
+                                )
+                                Text(
+                                    text = "Skips sites marked dead in Domain Intel during batch scans",
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Switch(
+                                checked = state.skipKnownDead,
+                                onCheckedChange = { viewModel.setSkipKnownDead(it) },
+                                enabled = !state.isScanning,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = palette.ink,
+                                    checkedTrackColor = palette.accentA
+                                ),
+                                modifier = Modifier.testTag("bonus_skip_dead_switch")
+                            )
+                        }
 
                         // Primary Start / Stop / Continue Action Row
                         Row(

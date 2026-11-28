@@ -41,6 +41,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.aistudio.pokiesvault.data.model.FetchActiveLane
 import com.aistudio.pokiesvault.ui.theme.LocalVaultPalette
 import com.aistudio.pokiesvault.ui.theme.MonoTextStyles
 import com.aistudio.pokiesvault.ui.viewmodel.BonusFinderUiState
@@ -269,14 +270,44 @@ fun LiveFetchStatsCard(
                 .padding(horizontal = 18.dp, vertical = 18.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Text(
-                text = "LIVE FETCH",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.labelMedium.copy(
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.6.sp
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "LIVE FETCH",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 1.6.sp
+                    )
                 )
-            )
+                if (state.isFetching && state.activeLane != FetchActiveLane.IDLE) {
+                    val laneColor = when (state.activeLane) {
+                        FetchActiveLane.SAVED_FAST -> palette.live
+                        FetchActiveLane.COLD_LOGIN -> palette.accentA
+                        FetchActiveLane.DNS_CLUSTERING -> palette.accentB
+                        FetchActiveLane.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = laneColor.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, laneColor.copy(alpha = 0.55f)),
+                        modifier = Modifier.testTag("live_fetch_lane_badge")
+                    ) {
+                        Text(
+                            text = state.activeLane.label.uppercase(),
+                            color = laneColor,
+                            style = MonoTextStyles.metricSmall.copy(
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            ),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+            }
 
             Spacer(modifier = Modifier.height(2.dp))
 
@@ -350,8 +381,14 @@ fun LiveFetchStatsCard(
                 modifier = Modifier.testTag("live_fetch_workers_line")
             )
 
+            val fetchRateSuffix = if (state.isFetching && state.rateSnapshot.sitesPerSec >= 0.05) {
+                val etaPart = state.rateSnapshot.etaSeconds?.let { " · ETA ${state.rateSnapshot.etaLabel}" } ?: ""
+                " · ${state.rateSnapshot.rateLabel}$etaPart"
+            } else {
+                ""
+            }
             Text(
-                text = "Wall ${state.wallElapsedSec}s · sign-in ${state.signInElapsedSec}s",
+                text = "Wall ${state.wallElapsedSec}s · sign-in ${state.signInElapsedSec}s$fetchRateSuffix",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
                 modifier = Modifier.testTag("live_fetch_timing_line")
@@ -464,8 +501,14 @@ fun LiveBonusScanStatsCard(
                 modifier = Modifier.testTag("live_bonus_workers_line")
             )
 
+            val bonusRateSuffix = if (state.isScanning && state.rateSnapshot.sitesPerSec >= 0.05) {
+                val etaPart = state.rateSnapshot.etaSeconds?.let { " · ETA ${state.rateSnapshot.etaLabel}" } ?: ""
+                " · ${state.rateSnapshot.rateLabel}$etaPart"
+            } else {
+                ""
+            }
             Text(
-                text = "Wall ${state.wallElapsedSec}s · scan ${state.scanElapsedSec}s",
+                text = "Wall ${state.wallElapsedSec}s · scan ${state.scanElapsedSec}s$bonusRateSuffix",
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MonoTextStyles.metricSmall.copy(fontSize = 13.sp),
                 modifier = Modifier.testTag("live_bonus_timing_line")

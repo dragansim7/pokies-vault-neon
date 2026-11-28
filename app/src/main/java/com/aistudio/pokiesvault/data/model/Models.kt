@@ -491,6 +491,13 @@ data class FetchCheckpoint(
     val savedAt: Long = 0L
 )
 
+enum class FetchActiveLane(val label: String) {
+    IDLE(""),
+    DNS_CLUSTERING("DNS Pre-Pass"),
+    SAVED_FAST("Saved Fast Lane"),
+    COLD_LOGIN("Cold Login Lane")
+}
+
 data class VaultPreferences(
     val themeId: VaultThemeId = VaultThemeId.VAULT,
     val viewMode: ViewMode = ViewMode.GROUPS,
@@ -503,7 +510,8 @@ data class VaultPreferences(
     val mineOnly: Boolean = false,
     val fetchSpeedPreset: FetchSpeedPreset = FetchSpeedPreset.SAFE,
     val bonusSpeedPreset: FetchSpeedPreset = FetchSpeedPreset.SAFE,
-    val allowBackgroundRuns: Boolean = false
+    val allowBackgroundRuns: Boolean = false,
+    val skipKnownDead: Boolean = false
 )
 
 @Serializable

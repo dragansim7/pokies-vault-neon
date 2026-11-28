@@ -12,6 +12,7 @@ import com.aistudio.pokiesvault.data.model.CardColor
 import com.aistudio.pokiesvault.data.model.DomainHealthRecord
 import com.aistudio.pokiesvault.data.model.EgressIpInfo
 import com.aistudio.pokiesvault.data.model.FallbackCred
+import com.aistudio.pokiesvault.data.model.FetchActiveLane
 import com.aistudio.pokiesvault.data.model.FetchCheckpoint
 import com.aistudio.pokiesvault.data.model.FetchRunSummary
 import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
@@ -30,11 +31,13 @@ import com.aistudio.pokiesvault.data.model.VaultThemeId
 import com.aistudio.pokiesvault.data.model.ViewMode
 import com.aistudio.pokiesvault.util.DomainUtil
 import com.aistudio.pokiesvault.util.FormatUtil
+import com.aistudio.pokiesvault.util.ScanRateSnapshot
 import com.aistudio.pokiesvault.util.SiteOrderUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -50,7 +53,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 
 data class EgressUiState(
     val isLoading: Boolean = true,
@@ -139,7 +144,11 @@ data class FetcherUiState(
     val cooldownSeconds: Int = 0,
     val cooldownReason: String = "",
     val sessionReusedCount: Int = 0,
-    val savedSessionDomains: Set<String> = emptySet()
+    val savedSessionDomains: Set<String> = emptySet(),
+    val activeLane: FetchActiveLane = FetchActiveLane.IDLE,
+    val rateSnapshot: ScanRateSnapshot = ScanRateSnapshot(),
+    val skipKnownDead: Boolean = false,
+    val knownDeadCount: Int = 0
 )
 
 data class BonusFinderItem(
@@ -185,7 +194,10 @@ data class BonusFinderUiState(
     val totalAttempts: Int = 0,
     val runLoadedCount: Int = 0,
     val runFailedCount: Int = 0,
-    val statusMessage: String = "Scan public promotions across your domain list without signing in."
+    val statusMessage: String = "Scan public promotions across your domain list without signing in.",
+    val rateSnapshot: ScanRateSnapshot = ScanRateSnapshot(),
+    val skipKnownDead: Boolean = false,
+    val knownDeadCount: Int = 0
 )
 
 data class IntelDomainRow(
@@ -471,7 +483,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         coordinator.cooldownSeconds,
         coordinator.cooldownReason,
         coordinator.sessionReusedCount,
-        domainSessionsFlow
+        domainSessionsFlow,
+        coordinator.activeFetchLane,
+        coordinator.fetcherRateSnapshot
     ) { arr ->
         val creds = arr[0] as VaultCredentials
         @Suppress("UNCHECKED_CAST")
@@ -504,6 +518,8 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val reusedCount = arr[21] as Int
         @Suppress("UNCHECKED_CAST")
         val savedSessionsMap = arr[22] as Map<String, SavedDomainSession>
+        val activeLane = arr[23] as FetchActiveLane
+        val rateSnapshot = arr[24] as ScanRateSnapshot
 
         val siteByDomain = HashMap<String, SiteRecord>(sites.size)
         val catalogIndexByDomain = HashMap<String, Int>(sites.size)
@@ -683,7 +699,11 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             cooldownSeconds = cooldownSec,
             cooldownReason = cooldownReason,
             sessionReusedCount = reusedCount,
-            savedSessionDomains = savedSessionsMap.filterValues { it.hasToken }.keys
+            savedSessionDomains = savedSessionsMap.filterValues { it.hasToken }.keys,
+            activeLane = activeLane,
+            rateSnapshot = rateSnapshot,
+            skipKnownDead = prefs.skipKnownDead,
+            knownDeadCount = sites.count { healthMap[it.domain]?.status == SiteStatus.DEAD }
         )
     }
         .flowOn(Dispatchers.Default)
@@ -712,7 +732,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         coordinator.bonusRunFailed,
         repository.engine.bonusActiveWorkers,
         repository.engine.bonusPeakWorkers,
-        repository.engine.bonusCurrentWorkerLimit
+        repository.engine.bonusCurrentWorkerLimit,
+        coordinator.bonusRateSnapshot,
+        healthMapFlow
     ) { arr ->
         @Suppress("UNCHECKED_CAST")
         val sites = arr[0] as List<SiteRecord>
@@ -740,6 +762,9 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         val activeW = arr[19] as Int
         val peakW = arr[20] as Int
         val limitW = arr[21] as Int
+        val bonusRate = arr[22] as ScanRateSnapshot
+        @Suppress("UNCHECKED_CAST")
+        val healthMap = arr[23] as Map<String, DomainHealthRecord>
 
         val domains = sites.map { it.domain }
         val loadedDomains = ArrayList<String>()
@@ -854,7 +879,10 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
             totalAttempts = attempts,
             runLoadedCount = runLoaded,
             runFailedCount = runFailed,
-            statusMessage = statusMsg
+            statusMessage = statusMsg,
+            rateSnapshot = bonusRate,
+            skipKnownDead = prefs.skipKnownDead,
+            knownDeadCount = sites.count { healthMap[it.domain]?.status == SiteStatus.DEAD }
         )
     }
         .flowOn(Dispatchers.Default)
@@ -1124,6 +1152,27 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { repository.setFetchSpeedPreset(preset) }
     }
 
+    fun setSkipKnownDead(enabled: Boolean) {
+        viewModelScope.launch { repository.setSkipKnownDead(enabled) }
+    }
+
+    fun syncSavedSessionsOnly() {
+        val visibleSet = visibleSitesFlow.value.mapTo(HashSet()) { it.domain }
+        val allSaved = domainSessionsFlow.value
+            .filterValues { it.hasToken }
+            .keys
+            .map { DomainUtil.normalizeDomain(it) }
+            .filter { DomainUtil.isPublicDomain(it) }
+            .distinct()
+        val visibleSaved = if (visibleSet.isEmpty()) allSaved else allSaved.filter { it in visibleSet }
+        val targets = visibleSaved.ifEmpty { allSaved }
+        if (targets.isEmpty()) {
+            coordinator.emitMessage("No saved sessions yet — run a fetch first to cache sessions.")
+            return
+        }
+        coordinator.startFetch(targets)
+    }
+
     fun resumeCheckpoint() = coordinator.resumeCheckpoint()
 
     fun discardCheckpoint() = coordinator.discardCheckpoint()
@@ -1276,6 +1325,24 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun hideDeadIntelDomains() {
+        val health = healthMapFlow.value
+        val deadDomains = visibleSitesFlow.value
+            .map { it.domain }
+            .filter { health[it]?.status == SiteStatus.DEAD }
+        if (deadDomains.isEmpty()) {
+            coordinator.emitMessage("No dead domains found in Domain Intel.")
+            return
+        }
+        viewModelScope.launch {
+            repository.hideDomains(deadDomains)
+            val deadSet = deadDomains.toSet()
+            _intelSelectedDomains.update { it - deadSet }
+            _intelStatus.value = "Hid ${deadDomains.size} dead domain(s) (restore anytime in Settings)."
+            coordinator.emitMessage("Hid ${deadDomains.size} dead domains (restore anytime in Settings).")
+        }
+    }
+
     fun importDomainsText(rawText: String, onFinished: (() -> Unit)? = null) {
         val domains = DomainUtil.extractDomainsFromText(rawText)
         if (domains.isEmpty()) {
@@ -1356,15 +1423,64 @@ class VaultViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 _intelStatus.value = "Probing ${targets.size} domain(s) directly…"
-                var done = 0
-                _checkingDomains.update { it + targets }
-                repository.engine.probeDomainsBatch(targets) { record ->
-                    repository.saveDomainHealth(record)
-                    _checkingDomains.update { it - record.domain }
-                    done++
-                    _intelProgress.value = done to targets.size
+                val doneCounter = AtomicInteger(0)
+                val flushMutex = Mutex()
+                val pendingRecords = LinkedHashMap<String, DomainHealthRecord>()
+                val pendingUiFinished = LinkedHashSet<String>()
+                var lastDbFlushMs = System.currentTimeMillis()
+                var lastUiPushMs = 0L
+
+                suspend fun flushPendingHealth(force: Boolean) {
+                    val (dbBatch, uiBatch) = flushMutex.withLock {
+                        val now = System.currentTimeMillis()
+                        val shouldDb = force ||
+                            pendingRecords.size >= 20 ||
+                            (pendingRecords.isNotEmpty() && (now - lastDbFlushMs) >= 1500L)
+                        val shouldUi = force ||
+                            (pendingUiFinished.isNotEmpty() && (now - lastUiPushMs) >= 150L)
+                        val dbCopy = if (shouldDb && pendingRecords.isNotEmpty()) {
+                            val c = pendingRecords.values.toList()
+                            pendingRecords.clear()
+                            lastDbFlushMs = now
+                            c
+                        } else emptyList()
+                        val uiCopy = if (shouldUi && pendingUiFinished.isNotEmpty()) {
+                            val c = pendingUiFinished.toSet()
+                            pendingUiFinished.clear()
+                            lastUiPushMs = now
+                            c
+                        } else emptySet()
+                        dbCopy to uiCopy
+                    }
+                    if (dbBatch.isNotEmpty()) {
+                        repository.saveDomainHealthBatch(dbBatch)
+                    }
+                    if (uiBatch.isNotEmpty() || force) {
+                        if (uiBatch.isNotEmpty()) {
+                            _checkingDomains.update { it - uiBatch }
+                        }
+                        _intelProgress.value = doneCounter.get() to targets.size
+                    }
                 }
-                _intelStatus.value = "Directly probed $done domain(s) with latency metrics."
+
+                _checkingDomains.update { it + targets }
+                try {
+                    repository.engine.probeDomainsBatch(targets) { record ->
+                        flushMutex.withLock {
+                            pendingRecords[record.domain] = record
+                            pendingUiFinished.add(record.domain)
+                        }
+                        val done = doneCounter.incrementAndGet()
+                        flushPendingHealth(force = done >= targets.size || targets.size <= 5)
+                    }
+                    flushPendingHealth(force = true)
+                    _intelStatus.value = "Directly probed ${doneCounter.get()} domain(s) with latency metrics."
+                } catch (e: CancellationException) {
+                    withContext(NonCancellable) {
+                        flushPendingHealth(force = true)
+                    }
+                    throw e
+                }
             } catch (_: CancellationException) {
                 _intelStatus.value = "Health check stopped. Completed results stay saved."
             } finally {

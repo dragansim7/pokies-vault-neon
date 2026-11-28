@@ -5,12 +5,14 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
 import com.aistudio.pokiesvault.MainActivity
 import com.aistudio.pokiesvault.PokiesVaultApp
@@ -219,10 +221,68 @@ class VaultBackgroundRunService : Service() {
 
     companion object {
         const val CHANNEL_ID = "pokies_vault_bg_runs"
+        const val ALERTS_CHANNEL_ID = "pokies_vault_scan_alerts"
         const val NOTIFICATION_ID = 4102
+        const val ALERT_NOTIFICATION_ID_FETCH = 4103
+        const val ALERT_NOTIFICATION_ID_BONUS = 4104
         const val ACTION_START_OR_SYNC = "com.aistudio.pokiesvault.action.START_OR_SYNC_BG"
         const val ACTION_STOP_ALL = "com.aistudio.pokiesvault.action.STOP_ALL_BG"
         private const val WAKE_LOCK_TAG = "PokiesVault:BackgroundScanWakeLock"
         private const val WAKE_LOCK_TIMEOUT_MS = 2L * 60L * 60L * 1000L // 2h safety cap
+
+        /**
+         * Posts a clean, dismissible completion or auto-pause summary alert when a background scan
+         * finishes or pauses on WAF. Safely no-ops if notifications are disabled or permission denied.
+         */
+        fun postRunSummaryNotification(
+            context: Context,
+            notificationId: Int,
+            title: String,
+            body: String
+        ) {
+            try {
+                val nmCompat = NotificationManagerCompat.from(context)
+                if (!nmCompat.areNotificationsEnabled()) return
+                val nm = context.getSystemService(NotificationManager::class.java) ?: return
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                    nm.getNotificationChannel(ALERTS_CHANNEL_ID) == null
+                ) {
+                    val channel = NotificationChannel(
+                        ALERTS_CHANNEL_ID,
+                        context.getString(R.string.bg_alerts_channel_name),
+                        NotificationManager.IMPORTANCE_DEFAULT
+                    ).apply {
+                        description = context.getString(R.string.bg_alerts_channel_desc)
+                    }
+                    nm.createNotificationChannel(channel)
+                }
+
+                val openIntent = Intent(context, MainActivity::class.java).apply {
+                    flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                }
+                val openPending = PendingIntent.getActivity(
+                    context,
+                    notificationId,
+                    openIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+
+                val notification = NotificationCompat.Builder(context, ALERTS_CHANNEL_ID)
+                    .setSmallIcon(android.R.drawable.stat_notify_sync_noanim)
+                    .setContentTitle(title)
+                    .setContentText(body)
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    .setCategory(NotificationCompat.CATEGORY_STATUS)
+                    .setContentIntent(openPending)
+                    .build()
+
+                nm.notify(notificationId, notification)
+            } catch (_: SecurityException) {
+                // POST_NOTIFICATIONS denied on Android 13+ — silently skip
+            } catch (_: Exception) {
+            }
+        }
     }
 }

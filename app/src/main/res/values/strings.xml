@@ -31,4 +31,9 @@
     <string name="bg_battery_hint_title">Battery saver may pause background scans</string>
     <string name="bg_battery_hint_action">Unrestricted</string>
     <string name="bg_battery_hint_cd">Open Android battery settings for Pokies Vault</string>
+    <string name="bg_alerts_channel_name">Scan Completion Alerts</string>
+    <string name="bg_alerts_channel_desc">Summary notifications when background account or bonus scans finish or auto-pause</string>
+    <string name="sync_saved_sessions_fmt">Sync Saved (%1$d)</string>
+    <string name="skip_known_dead_label">Skip known dead domains</string>
+    <string name="hide_dead_domains_fmt">Hide %1$d dead</string>
 </resources>

@@ -6,6 +6,7 @@ import androidx.core.content.ContextCompat
 import com.aistudio.pokiesvault.data.model.AccountResult
 import com.aistudio.pokiesvault.data.model.CheckpointPauseReason
 import com.aistudio.pokiesvault.data.model.EgressIpInfo
+import com.aistudio.pokiesvault.data.model.FetchActiveLane
 import com.aistudio.pokiesvault.data.model.FetchCheckpoint
 import com.aistudio.pokiesvault.data.model.FetchRunSummary
 import com.aistudio.pokiesvault.data.model.FetchSpeedPreset
@@ -18,6 +19,9 @@ import com.aistudio.pokiesvault.data.repository.VaultRepository
 import com.aistudio.pokiesvault.service.VaultBackgroundRunService
 import com.aistudio.pokiesvault.util.DomainUtil
 import com.aistudio.pokiesvault.util.FormatUtil
+import com.aistudio.pokiesvault.util.ScanRateSnapshot
+import com.aistudio.pokiesvault.util.ScanTelemetryUtil
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -145,6 +149,12 @@ class VaultRunCoordinator(
     private val _sessionReusedCount = MutableStateFlow(0)
     val sessionReusedCount: StateFlow<Int> = _sessionReusedCount.asStateFlow()
 
+    private val _activeFetchLane = MutableStateFlow(FetchActiveLane.IDLE)
+    val activeFetchLane: StateFlow<FetchActiveLane> = _activeFetchLane.asStateFlow()
+
+    private val _fetcherRateSnapshot = MutableStateFlow(ScanRateSnapshot())
+    val fetcherRateSnapshot: StateFlow<ScanRateSnapshot> = _fetcherRateSnapshot.asStateFlow()
+
     // --- Bonus Finder Live State ---
     private val _bonusRunning = MutableStateFlow(false)
     val bonusRunning: StateFlow<Boolean> = _bonusRunning.asStateFlow()
@@ -181,6 +191,9 @@ class VaultRunCoordinator(
     private val _bonusCooldownSeconds = MutableStateFlow(0)
     val bonusCooldownSeconds: StateFlow<Int> = _bonusCooldownSeconds.asStateFlow()
 
+    private val _bonusRateSnapshot = MutableStateFlow(ScanRateSnapshot())
+    val bonusRateSnapshot: StateFlow<ScanRateSnapshot> = _bonusRateSnapshot.asStateFlow()
+
     val hasActiveRun: StateFlow<Boolean> = combine(
         _fetcherRunning,
         _bonusRunning
@@ -196,7 +209,10 @@ class VaultRunCoordinator(
         _bonusRunLoaded,
         _bonusRunFailed,
         repository.engine.activeWorkers,
-        repository.engine.bonusActiveWorkers
+        repository.engine.bonusActiveWorkers,
+        _activeFetchLane,
+        _fetcherRateSnapshot,
+        _bonusRateSnapshot
     ) { arr ->
         val prefs = arr[0] as VaultPreferences
         val fetchOn = arr[1] as Boolean
@@ -209,6 +225,9 @@ class VaultRunCoordinator(
         val bFailed = arr[6] as Int
         val fWorkers = arr[7] as Int
         val bWorkers = arr[8] as Int
+        val lane = arr[9] as FetchActiveLane
+        val fetchRate = arr[10] as ScanRateSnapshot
+        val bonusRate = arr[11] as ScanRateSnapshot
 
         when {
             fetchOn && bonusOn -> {
@@ -225,22 +244,29 @@ class VaultRunCoordinator(
             }
             fetchOn -> {
                 val pct = if (fetchProg.second > 0) (fetchProg.first * 100) / fetchProg.second else 0
+                val lanePart = if (lane != FetchActiveLane.IDLE) "${lane.label} · " else ""
+                val ratePart = if (fetchRate.sitesPerSec >= 0.05) {
+                    " · ${fetchRate.rateLabel}" + (fetchRate.etaSeconds?.let { " · ETA ${fetchRate.etaLabel}" } ?: "")
+                } else ""
                 BackgroundRunNotificationState(
                     isRunning = true,
                     allowBackground = prefs.allowBackgroundRuns,
                     title = "Account Fetcher · ${fetchProg.first}/${fetchProg.second} ($pct%)",
-                    subtitle = "${fWorkers} active workers · keeping run alive in background",
+                    subtitle = "${lanePart}${fWorkers}w${ratePart}",
                     progressDone = fetchProg.first,
                     progressTotal = fetchProg.second
                 )
             }
             bonusOn -> {
                 val pct = if (bonusProg.second > 0) (bonusProg.first * 100) / bonusProg.second else 0
+                val ratePart = if (bonusRate.sitesPerSec >= 0.05) {
+                    " · ${bonusRate.rateLabel}" + (bonusRate.etaSeconds?.let { " · ETA ${bonusRate.etaLabel}" } ?: "")
+                } else ""
                 BackgroundRunNotificationState(
                     isRunning = true,
                     allowBackground = prefs.allowBackgroundRuns,
                     title = "Bonus Finder · ${bonusProg.first}/${bonusProg.second} ($pct%)",
-                    subtitle = "$bLoaded loaded · $bFailed failed · $bWorkers workers",
+                    subtitle = "$bLoaded loaded · ${bWorkers}w$ratePart",
                     progressDone = bonusProg.first,
                     progressTotal = bonusProg.second
                 )
@@ -368,6 +394,9 @@ class VaultRunCoordinator(
         val bFailed = _bonusRunFailed.value
         val fWorkers = repository.engine.activeWorkers.value
         val bWorkers = repository.engine.bonusActiveWorkers.value
+        val lane = _activeFetchLane.value
+        val fetchRate = _fetcherRateSnapshot.value
+        val bonusRate = _bonusRateSnapshot.value
 
         return when {
             fetchOn && bonusOn -> {
@@ -384,22 +413,29 @@ class VaultRunCoordinator(
             }
             fetchOn -> {
                 val pct = if (fetchProg.second > 0) (fetchProg.first * 100) / fetchProg.second else 0
+                val lanePart = if (lane != FetchActiveLane.IDLE) "${lane.label} · " else ""
+                val ratePart = if (fetchRate.sitesPerSec >= 0.05) {
+                    " · ${fetchRate.rateLabel}" + (fetchRate.etaSeconds?.let { " · ETA ${fetchRate.etaLabel}" } ?: "")
+                } else ""
                 BackgroundRunNotificationState(
                     isRunning = true,
                     allowBackground = allow,
                     title = "Account Fetcher · ${fetchProg.first}/${fetchProg.second} ($pct%)",
-                    subtitle = "$fWorkers active workers · keeping run alive in background",
+                    subtitle = "${lanePart}${fWorkers}w$ratePart",
                     progressDone = fetchProg.first,
                     progressTotal = fetchProg.second
                 )
             }
             bonusOn -> {
                 val pct = if (bonusProg.second > 0) (bonusProg.first * 100) / bonusProg.second else 0
+                val ratePart = if (bonusRate.sitesPerSec >= 0.05) {
+                    " · ${bonusRate.rateLabel}" + (bonusRate.etaSeconds?.let { " · ETA ${bonusRate.etaLabel}" } ?: "")
+                } else ""
                 BackgroundRunNotificationState(
                     isRunning = true,
                     allowBackground = allow,
                     title = "Bonus Finder · ${bonusProg.first}/${bonusProg.second} ($pct%)",
-                    subtitle = "$bLoaded loaded · $bFailed failed · $bWorkers workers",
+                    subtitle = "$bLoaded loaded · ${bWorkers}w$ratePart",
                     progressDone = bonusProg.first,
                     progressTotal = bonusProg.second
                 )
@@ -482,11 +518,11 @@ class VaultRunCoordinator(
             return
         }
 
-        val allTargetDomains: List<String>
-        val dispatchDomains: List<String>
+        val initialAllTargets: List<String>
+        val initialDispatch: List<String>
         if (resumeCheckpoint != null) {
-            allTargetDomains = resumeCheckpoint.allTargetDomains.distinct()
-            dispatchDomains = resumeCheckpoint.remainingDomains
+            initialAllTargets = resumeCheckpoint.allTargetDomains.distinct()
+            initialDispatch = resumeCheckpoint.remainingDomains
                 .map { DomainUtil.normalizeDomain(it) }
                 .filter { DomainUtil.isPublicDomain(it) }
                 .distinct()
@@ -495,11 +531,11 @@ class VaultRunCoordinator(
                 .map { DomainUtil.normalizeDomain(it) }
                 .filter { DomainUtil.isPublicDomain(it) }
                 .distinct()
-            allTargetDomains = normalized
-            dispatchDomains = normalized
+            initialAllTargets = normalized
+            initialDispatch = normalized
         }
 
-        if (dispatchDomains.isEmpty()) {
+        if (initialDispatch.isEmpty()) {
             _fetcherStatus.value = "No sites selected. Bookmark accounts, enter a domain, or run a full scan."
             return
         }
@@ -507,15 +543,47 @@ class VaultRunCoordinator(
         fetchJob?.cancel()
         fetchWallTimerJob?.cancel()
         fetchJob = scope.launch {
-            val preset = preferencesFlow.value.fetchSpeedPreset
+            val prefs = preferencesFlow.value
+            val preset = prefs.fetchSpeedPreset
+            var skippedDeadCount = 0
+            val allTargetDomains: List<String>
+            val dispatchDomains: List<String>
+            if (resumeCheckpoint == null && prefs.skipKnownDead && initialDispatch.size > 1) {
+                val healthMap = try {
+                    repository.loadDomainHealthMap()
+                } catch (_: Throwable) {
+                    emptyMap()
+                }
+                val (filtered, skipped) = ScanTelemetryUtil.filterKnownDeadDomains(
+                    domains = initialDispatch,
+                    healthMap = healthMap,
+                    skipKnownDead = true
+                )
+                skippedDeadCount = skipped
+                if (filtered.isEmpty()) {
+                    _fetcherStatus.value = "All ${initialDispatch.size} selected domains are marked dead in Domain Intel. Disable 'Skip known dead' or re-check Intel."
+                    _snackbarEvents.tryEmit("All selected domains are marked dead in Domain Intel.")
+                    return@launch
+                }
+                allTargetDomains = filtered
+                dispatchDomains = filtered
+            } else {
+                allTargetDomains = initialAllTargets
+                dispatchDomains = initialDispatch
+            }
+
             val runStartedAt = resumeCheckpoint?.runStartedAt ?: System.currentTimeMillis()
             val segmentStartedAt = System.currentTimeMillis()
             val baseElapsedWallSec = resumeCheckpoint?.elapsedWallSec ?: 0L
+            val segmentCompletedCounter = AtomicInteger(0)
             val collectedMap = LinkedHashMap<String, AccountResult>(allTargetDomains.size)
             val pendingSnapshots = LinkedHashMap<String, AccountResult>()
             val pendingSessionsMutex = Mutex()
             val pendingSessions = LinkedHashMap<String, SavedDomainSession>()
             var lastSessionFlushMs = System.currentTimeMillis()
+            val pendingExpiredMutex = Mutex()
+            val pendingExpiredTokens = LinkedHashSet<String>()
+            var lastExpiredFlushMs = System.currentTimeMillis()
             val pendingHostsMutex = Mutex()
             val pendingHosts = LinkedHashMap<String, HostTarget>()
             var lastHostFlushMs = System.currentTimeMillis()
@@ -558,6 +626,24 @@ class VaultRunCoordinator(
                 }
             }
 
+            suspend fun flushPendingExpiredTokens(force: Boolean) {
+                val batch: List<String> = pendingExpiredMutex.withLock {
+                    if (pendingExpiredTokens.isEmpty()) return
+                    val now = System.currentTimeMillis()
+                    if (!force && pendingExpiredTokens.size < 20 && (now - lastExpiredFlushMs) < 4000L) {
+                        return
+                    }
+                    val copy = pendingExpiredTokens.toList()
+                    pendingExpiredTokens.clear()
+                    lastExpiredFlushMs = now
+                    copy
+                }
+                try {
+                    repository.clearDomainTokensBatch(batch)
+                } catch (_: Throwable) {
+                }
+            }
+
             suspend fun flushPendingSnapshotsToRoom(forceAllIfNew: Boolean = false): Long? {
                 val delta = if (activeRunId == null && forceAllIfNew) {
                     collectedMap.values.toList()
@@ -587,6 +673,8 @@ class VaultRunCoordinator(
             }
 
             _fetcherRunning.value = true
+            _activeFetchLane.value = FetchActiveLane.IDLE
+            _fetcherRateSnapshot.value = ScanRateSnapshot()
             _viewingRunId.value = null
             _cooldownSeconds.value = 0
             _cooldownReason.value = ""
@@ -594,6 +682,7 @@ class VaultRunCoordinator(
             _fetcherDiffs.value = emptyList()
             _showRejected.value = false
             _wallElapsedSec.value = baseElapsedWallSec
+            val skippedDeadSuffix = if (skippedDeadCount > 0) " (skipped $skippedDeadCount dead)" else ""
             _liveStatusLabel.value = if (resumeCheckpoint != null) "Loading checkpoint…" else "Running (${preset.displayName})…"
             _fetcherStatus.value = when {
                 resumeCheckpoint != null ->
@@ -601,7 +690,7 @@ class VaultRunCoordinator(
                 dispatchDomains.size == 1 ->
                     "Checking ${dispatchDomains.first()}…"
                 else ->
-                    "${preset.displayName} mode checking ${dispatchDomains.size} sites (${preset.subtitle})…"
+                    "${preset.displayName} mode checking ${dispatchDomains.size} sites$skippedDeadSuffix (${preset.subtitle})…"
             }
             syncForegroundService()
 
@@ -646,15 +735,23 @@ class VaultRunCoordinator(
                     dispatchDomains.size == 1 ->
                         "Checking ${dispatchDomains.first()}…"
                     else ->
-                        "${preset.displayName} mode checking ${dispatchDomains.size} sites (${preset.subtitle})…"
+                        "${preset.displayName} mode checking ${dispatchDomains.size} sites$skippedDeadSuffix (${preset.subtitle})…"
                 }
                 syncForegroundService()
 
                 fetchWallTimerJob = scope.launch {
                     while (isActive) {
                         delay(1000L)
-                        val segSec = (System.currentTimeMillis() - segmentStartedAt) / 1000L
+                        val elapsedMs = System.currentTimeMillis() - segmentStartedAt
+                        val segSec = elapsedMs / 1000L
                         _wallElapsedSec.value = baseElapsedWallSec + segSec
+                        val segDone = segmentCompletedCounter.get()
+                        val remaining = (dispatchDomains.size - segDone).coerceAtLeast(0)
+                        _fetcherRateSnapshot.value = ScanTelemetryUtil.computeThroughputAndEta(
+                            completedInSegment = segDone,
+                            remainingCount = remaining,
+                            segmentElapsedMs = elapsedMs
+                        )
                     }
                 }
 
@@ -685,9 +782,12 @@ class VaultRunCoordinator(
                         }
                     },
                     onSessionExpired = { dom ->
-                        try {
-                            repository.clearDomainToken(dom)
-                        } catch (_: Throwable) {
+                        val key = dom.trim().lowercase()
+                        if (key.isNotBlank()) {
+                            pendingExpiredMutex.withLock {
+                                pendingExpiredTokens.add(key)
+                            }
+                            flushPendingExpiredTokens(force = false)
                         }
                     },
                     onSessionReused = { _sessionReusedCount.update { it + 1 } },
@@ -701,9 +801,13 @@ class VaultRunCoordinator(
                             _liveStatusLabel.value = "Running (${preset.displayName})…"
                         }
                     },
+                    onLaneChanged = { lane ->
+                        _activeFetchLane.value = lane
+                    },
                     onResult = { res ->
                         collectedMap[res.domain] = res
                         pendingSnapshots[res.domain] = res
+                        val segDone = segmentCompletedCounter.incrementAndGet()
                         sinceLastCheckpoint++
                         sinceLastRoomFlush++
                         val now = System.currentTimeMillis()
@@ -714,6 +818,11 @@ class VaultRunCoordinator(
                         if (now - lastProgressPush >= 150L || isComplete) {
                             lastProgressPush = now
                             _fetcherProgress.value = doneCount to allTargetDomains.size
+                            _fetcherRateSnapshot.value = ScanTelemetryUtil.computeThroughputAndEta(
+                                completedInSegment = segDone,
+                                remainingCount = (dispatchDomains.size - segDone).coerceAtLeast(0),
+                                segmentElapsedMs = now - segmentStartedAt
+                            )
                         }
 
                         // Decouple heavy full-list UI copies (750ms during big scans; instant for small runs)
@@ -729,6 +838,7 @@ class VaultRunCoordinator(
                                 sinceLastRoomFlush = 0
                                 flushPendingSnapshotsToRoom(forceAllIfNew = false)
                                 flushPendingSessions(force = false)
+                                flushPendingExpiredTokens(force = false)
                                 flushPendingHosts(force = false)
                             }
                             val doneDomains = collectedMap.keys.toList()
@@ -760,6 +870,7 @@ class VaultRunCoordinator(
                 val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
                 val totalWallSec = (totalWallMs + 500L) / 1000L
                 _wallElapsedSec.value = totalWallSec
+                flushPendingExpiredTokens(force = true)
                 flushPendingSessions(force = true)
                 flushPendingHosts(force = true)
 
@@ -792,6 +903,14 @@ class VaultRunCoordinator(
                     _liveStatusLabel.value = "Paused (WAF)"
                     _fetcherStatus.value = "Auto-paused to protect your IP (${report.pauseDetail}). ${remaining.size} sites queued to resume."
                     _snackbarEvents.tryEmit("Auto-paused: rate-limit / firewall block detected. Wait or switch network before resuming.")
+                    if (allowBackgroundState) {
+                        VaultBackgroundRunService.postRunSummaryNotification(
+                            context = appContext,
+                            notificationId = VaultBackgroundRunService.ALERT_NOTIFICATION_ID_FETCH,
+                            title = "Account Scan Auto-Paused (WAF)",
+                            body = "${remaining.size} sites remaining — tap to review and resume safely."
+                        )
+                    }
                 } else {
                     val finalRows = collectedMap.values.toList()
                     repository.clearCheckpoint()
@@ -811,7 +930,9 @@ class VaultRunCoordinator(
                         }
                     }
                     _fetcherDiffs.value = diffs
-                    val okCount = finalRows.count { it is AccountResult.Ok }
+                    val okRows = finalRows.filterIsInstance<AccountResult.Ok>()
+                    val okCount = okRows.size
+                    val totalCash = okRows.sumOf { it.cash }
                     val elapsedSec = totalWallMs / 1000.0
                     _liveStatusLabel.value = "Done"
                     val reusedNote = if (report.sessionsReused > 0) {
@@ -825,12 +946,21 @@ class VaultRunCoordinator(
                         finalRows.size,
                         reusedNote
                     )
+                    if (allowBackgroundState && allTargetDomains.size > 1) {
+                        VaultBackgroundRunService.postRunSummaryNotification(
+                            context = appContext,
+                            notificationId = VaultBackgroundRunService.ALERT_NOTIFICATION_ID_FETCH,
+                            title = "Account Scan Complete",
+                            body = "$okCount of ${finalRows.size} signed in · ${FormatUtil.money(totalCash)} total cash."
+                        )
+                    }
                 }
             } catch (_: CancellationException) {
                 withContext(NonCancellable) {
                     val totalWallMs = (baseElapsedWallSec * 1000L) + (System.currentTimeMillis() - segmentStartedAt)
                     val totalWallSec = (totalWallMs + 500L) / 1000L
                     _wallElapsedSec.value = totalWallSec
+                    flushPendingExpiredTokens(force = true)
                     flushPendingSessions(force = true)
                     flushPendingHosts(force = true)
                     val partial = collectedMap.values.toList()
@@ -867,6 +997,7 @@ class VaultRunCoordinator(
                 }
             } catch (t: Throwable) {
                 withContext(NonCancellable) {
+                    flushPendingExpiredTokens(force = true)
                     flushPendingSessions(force = true)
                     flushPendingHosts(force = true)
                     val partialRunId = flushPendingSnapshotsToRoom(forceAllIfNew = activeRunId == null)
@@ -899,6 +1030,8 @@ class VaultRunCoordinator(
             } finally {
                 fetchWallTimerJob?.cancel()
                 fetchWallTimerJob = null
+                _activeFetchLane.value = FetchActiveLane.IDLE
+                _fetcherRateSnapshot.value = ScanRateSnapshot()
                 _cooldownSeconds.value = 0
                 _cooldownReason.value = ""
                 _fetcherRunning.value = false
@@ -992,11 +1125,11 @@ class VaultRunCoordinator(
         domainsToScan: List<String>,
         resumeCheckpoint: FetchCheckpoint? = null
     ) {
-        val allTargetDomains: List<String>
-        val dispatchDomains: List<String>
+        val initialAllTargets: List<String>
+        val initialDispatch: List<String>
         if (resumeCheckpoint != null) {
-            allTargetDomains = resumeCheckpoint.allTargetDomains.distinct()
-            dispatchDomains = resumeCheckpoint.remainingDomains
+            initialAllTargets = resumeCheckpoint.allTargetDomains.distinct()
+            initialDispatch = resumeCheckpoint.remainingDomains
                 .map { DomainUtil.normalizeDomain(it) }
                 .filter { DomainUtil.isPublicDomain(it) }
                 .distinct()
@@ -1005,11 +1138,11 @@ class VaultRunCoordinator(
                 .map { DomainUtil.normalizeDomain(it) }
                 .filter { DomainUtil.isPublicDomain(it) }
                 .distinct()
-            allTargetDomains = normalized
-            dispatchDomains = normalized
+            initialAllTargets = normalized
+            initialDispatch = normalized
         }
 
-        if (dispatchDomains.isEmpty()) {
+        if (initialDispatch.isEmpty()) {
             _bonusStatus.value = "No domains to scan."
             return
         }
@@ -1017,10 +1150,39 @@ class VaultRunCoordinator(
         bonusScanJob?.cancel()
         bonusWallTimerJob?.cancel()
         bonusScanJob = scope.launch {
-            val preset: FetchSpeedPreset = preferencesFlow.value.bonusSpeedPreset
+            val prefs = preferencesFlow.value
+            val preset: FetchSpeedPreset = prefs.bonusSpeedPreset
+            var skippedDeadCount = 0
+            val allTargetDomains: List<String>
+            val dispatchDomains: List<String>
+            if (resumeCheckpoint == null && prefs.skipKnownDead && initialDispatch.size > 1) {
+                val healthMap = try {
+                    repository.loadDomainHealthMap()
+                } catch (_: Throwable) {
+                    emptyMap()
+                }
+                val (filtered, skipped) = ScanTelemetryUtil.filterKnownDeadDomains(
+                    domains = initialDispatch,
+                    healthMap = healthMap,
+                    skipKnownDead = true
+                )
+                skippedDeadCount = skipped
+                if (filtered.isEmpty()) {
+                    _bonusStatus.value = "All ${initialDispatch.size} selected domains are marked dead in Domain Intel. Disable 'Skip known dead' or re-check Intel."
+                    _snackbarEvents.tryEmit("All selected domains are marked dead in Domain Intel.")
+                    return@launch
+                }
+                allTargetDomains = filtered
+                dispatchDomains = filtered
+            } else {
+                allTargetDomains = initialAllTargets
+                dispatchDomains = initialDispatch
+            }
+
             val runStartedAt = resumeCheckpoint?.runStartedAt ?: System.currentTimeMillis()
             val segmentStartedAt = System.currentTimeMillis()
             val baseElapsedWallSec = resumeCheckpoint?.elapsedWallSec ?: 0L
+            val segmentCompletedCounter = AtomicInteger(0)
             val hostCache = repository.loadHostCacheMap()
 
             val completedSet = LinkedHashSet<String>()
@@ -1037,6 +1199,7 @@ class VaultRunCoordinator(
             var totalAttempts = 0
 
             _bonusRunning.value = true
+            _bonusRateSnapshot.value = ScanRateSnapshot()
             _bonusProgress.value = completedSet.size to allTargetDomains.size
             _bonusWallElapsedSec.value = baseElapsedWallSec
             if (resumeCheckpoint == null) {
@@ -1046,6 +1209,7 @@ class VaultRunCoordinator(
                 _bonusRunLoaded.value = 0
                 _bonusRunFailed.value = 0
             }
+            val skippedDeadSuffix = if (skippedDeadCount > 0) " (skipped $skippedDeadCount dead)" else ""
             _bonusLiveStatusLabel.value = "Running (${preset.displayName})…"
             _bonusStatus.value = when {
                 resumeCheckpoint != null ->
@@ -1053,15 +1217,23 @@ class VaultRunCoordinator(
                 dispatchDomains.size == 1 ->
                     "Loading public bonuses for ${dispatchDomains.first()}…"
                 else ->
-                    "${preset.displayName} mode scanning ${dispatchDomains.size} domains (${preset.bonusSubtitle})…"
+                    "${preset.displayName} mode scanning ${dispatchDomains.size} domains$skippedDeadSuffix (${preset.bonusSubtitle})…"
             }
             syncForegroundService()
 
             bonusWallTimerJob = scope.launch {
                 while (isActive) {
                     delay(1000L)
-                    val segSec = (System.currentTimeMillis() - segmentStartedAt) / 1000L
+                    val elapsedMs = System.currentTimeMillis() - segmentStartedAt
+                    val segSec = elapsedMs / 1000L
                     _bonusWallElapsedSec.value = baseElapsedWallSec + segSec
+                    val segDone = segmentCompletedCounter.get()
+                    val remaining = (dispatchDomains.size - segDone).coerceAtLeast(0)
+                    _bonusRateSnapshot.value = ScanTelemetryUtil.computeThroughputAndEta(
+                        completedInSegment = segDone,
+                        remainingCount = remaining,
+                        segmentElapsedMs = elapsedMs
+                    )
                 }
             }
 
@@ -1125,6 +1297,7 @@ class VaultRunCoordinator(
                             pendingBonusResults[res.domain] = res
                         }
                         completedSet.add(res.domain)
+                        val segDone = segmentCompletedCounter.incrementAndGet()
                         if (res.ok) runLoaded++ else runFailed++
                         totalLatencyMs += res.latencyMs
                         totalRetries += res.retriesUsed
@@ -1143,6 +1316,11 @@ class VaultRunCoordinator(
                             _bonusScanLatencyMs.value = totalLatencyMs
                             _bonusRetries.value = totalRetries
                             _bonusAttempts.value = totalAttempts
+                            _bonusRateSnapshot.value = ScanTelemetryUtil.computeThroughputAndEta(
+                                completedInSegment = segDone,
+                                remainingCount = (dispatchDomains.size - segDone).coerceAtLeast(0),
+                                segmentElapsedMs = now - segmentStartedAt
+                            )
                         }
 
                         // Periodic durable checkpoint during larger bonus scans (>25 domains)
@@ -1205,6 +1383,14 @@ class VaultRunCoordinator(
                     _bonusLiveStatusLabel.value = "Paused (WAF)"
                     _bonusStatus.value = "Auto-paused (${report.pauseDetail}). ${remaining.size} domains queued to continue."
                     _snackbarEvents.tryEmit("Bonus scan auto-paused on firewall / rate-limit blocks.")
+                    if (allowBackgroundState) {
+                        VaultBackgroundRunService.postRunSummaryNotification(
+                            context = appContext,
+                            notificationId = VaultBackgroundRunService.ALERT_NOTIFICATION_ID_BONUS,
+                            title = "Bonus Scan Auto-Paused (WAF)",
+                            body = "${remaining.size} domains remaining — tap to resume."
+                        )
+                    }
                 } else {
                     if (allTargetDomains.size > 1 || resumeCheckpoint != null) {
                         repository.clearBonusCheckpoint()
@@ -1219,6 +1405,14 @@ class VaultRunCoordinator(
                         runLoaded,
                         runFailed
                     )
+                    if (allowBackgroundState && allTargetDomains.size > 1) {
+                        VaultBackgroundRunService.postRunSummaryNotification(
+                            context = appContext,
+                            notificationId = VaultBackgroundRunService.ALERT_NOTIFICATION_ID_BONUS,
+                            title = "Bonus Scan Complete",
+                            body = "$runLoaded loaded · $runFailed failed across ${completedSet.size} domains."
+                        )
+                    }
                 }
             } catch (_: CancellationException) {
                 withContext(NonCancellable) {
@@ -1286,6 +1480,7 @@ class VaultRunCoordinator(
             } finally {
                 bonusWallTimerJob?.cancel()
                 bonusWallTimerJob = null
+                _bonusRateSnapshot.value = ScanRateSnapshot()
                 _bonusCooldownSeconds.value = 0
                 _bonusRunning.value = false
                 syncForegroundService()
@@ -1321,6 +1516,8 @@ class VaultRunCoordinator(
         _cooldownSeconds.value = 0
         _cooldownReason.value = ""
         _sessionReusedCount.value = 0
+        _activeFetchLane.value = FetchActiveLane.IDLE
+        _fetcherRateSnapshot.value = ScanRateSnapshot()
         _fetcherDiffs.value = emptyList()
         _bonusProgress.value = 0 to 0
         _bonusWallElapsedSec.value = 0L
@@ -1330,6 +1527,7 @@ class VaultRunCoordinator(
         _bonusRunLoaded.value = 0
         _bonusRunFailed.value = 0
         _bonusCooldownSeconds.value = 0
+        _bonusRateSnapshot.value = ScanRateSnapshot()
         _bonusLiveStatusLabel.value = "Idle"
         _bonusStatus.value = "Scan public promotions across your domain list without signing in."
         syncForegroundService(forceAllowValue = false)
